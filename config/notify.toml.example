@@ -1,0 +1,12 @@
+# 通知渠道配置（可选）：快照轮转完成后发送结果到钉钉群
+# 本文件不存在 = 不通知
+# kind: none（不通知）| dingtalk
+# prefix: 消息标题签名（如「【通知】」），钉钉自定义机器人无独立签名/别名字段，用前缀标记来源；空 = 不加
+# webhook/secret 也可用环境变量 DINGTALK_WEBHOOK_URL / DINGTALK_SECRET 注入（推荐，勿提交到 git）
+
+kind = "none"
+# prefix = "【通知】"
+
+[dingtalk]
+webhook = ""
+secret = ""

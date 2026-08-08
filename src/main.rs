@@ -1,12 +1,15 @@
 //! ops-console —— 服务商运维系统。
 //!
 //! 用法示例：
-//!   ops-console aliyun instance list
-//!   ops-console aliyun snapshot list --instance <id>
-//!   ops-console aliyun snapshot rotate --instance <id> --keep 2
+//!   ops-console --project demo snapshot list --instance <id>
+//!   ops-console snapshot rotate --instance <id> --keep 2
+//!   ops-console --provider aliyun snapshot list --instance <id>
+//!
+//! 未指定 --project 时遍历全部项目；未指定 --provider 时执行项目内全部服务商。
 
 mod cloud;
 mod config;
+mod notify;
 mod ops;
 
 use clap::{Parser, Subcommand};
@@ -23,9 +26,17 @@ use crate::cloud::CloudProvider;
     long_about = "服务商运维系统\n\n起步：阿里云轻量服务器快照轮转\n扩展：实现 cloud::CloudProvider trait 即可接入新服务商"
 )]
 struct Cli {
-    /// 配置文件路径
-    #[arg(long, default_value = "config/providers.toml")]
+    /// 配置目录（内含 project.toml / notify.toml）
+    #[arg(long, default_value = "config")]
     config: String,
+
+    /// 目标项目名（默认全部项目）
+    #[arg(long, global = true)]
+    project: Option<String>,
+
+    /// 只执行指定服务商（默认项目内全部服务商）
+    #[arg(long, global = true)]
+    provider: Option<String>,
 
     /// 日志级别 (error|warn|info|debug)
     #[arg(long, default_value = "info")]
@@ -37,55 +48,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 阿里云
-    #[command(subcommand)]
-    Aliyun(AliyunCmd),
-}
+    /// 列出配置中的项目
+    Projects,
 
-#[derive(Subcommand)]
-enum AliyunCmd {
-    /// 实例操作
-    #[command(subcommand)]
-    Instance(InstanceCmd),
-
-    /// 快照操作
-    #[command(subcommand)]
-    Snapshot(SnapshotCmd),
-}
-
-#[derive(Subcommand)]
-enum InstanceCmd {
-    /// 列出实例
-    List {
-        /// 按名称过滤（模糊匹配）
-        #[arg(long)]
-        name: Option<String>,
-    },
-}
-
-#[derive(Subcommand)]
-enum SnapshotCmd {
-    /// 列出实例快照
-    List {
-        #[arg(long)]
-        instance: String,
-    },
-
-    /// 手动创建快照
-    Create {
-        #[arg(long)]
-        instance: String,
-
-        /// 快照名（默认 snap-<时间戳>）
-        #[arg(long)]
-        name: Option<String>,
-    },
-
-    /// 轮转：删旧建新，保留 keep 份可用快照
-    Rotate {
-        #[arg(long)]
-        instance: String,
-
+    /// 快照轮转：删旧建新，对目标项目全部（或 --provider 指定）服务商下的全部实例执行
+    Snapshot {
         /// 保留的快照份数（阿里云单台上限 3，建议 2）
         #[arg(long, default_value_t = 2)]
         keep: usize,
@@ -110,73 +77,135 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = config::Config::load(Path::new(&cli.config))?;
 
-    match cli.command {
-        Command::Aliyun(aliyun_cmd) => {
-            let (ak, sk) = cfg.aliyun_credentials()?;
-            let provider =
-                cloud::aliyun::AliyunProvider::new(&ak, &sk, &cfg.aliyun.region);
+    let project_errors = match cli.command {
+        Command::Projects => {
+            for p in &cfg.projects {
+                let kinds: Vec<&str> = p.providers.keys().map(|s| s.as_str()).collect();
+                let desc = p.description.as_deref().unwrap_or("");
+                println!("{:<20} providers: {:<24} {}", p.name, kinds.join(", "), desc);
+            }
+            Vec::new()
+        }
+        Command::Snapshot { keep, wait_minutes } => {
+            let targets: Vec<&config::Project> = match cli.project.as_deref() {
+                Some(name) => vec![cfg.select_project(Some(name))?],
+                None => cfg.projects.iter().collect(),
+            };
+            let mut errors = Vec::new();
+            for project in targets {
+                println!("\n===== 项目: {} =====", project.name);
+                if let Err(e) = run_project_rotate(&cfg, project, cli.provider.as_deref(), keep, wait_minutes)
+                    .await
+                {
+                    println!("项目 {} 执行失败: {e:#}", project.name);
+                    errors.push(project.name.clone());
+                }
+            }
+            errors
+        }
+    };
 
-            match aliyun_cmd {
-                AliyunCmd::Instance(InstanceCmd::List { name }) => {
-                    let servers = provider.list_servers().await?;
-                    println!(
-                        "{:<24} {:<32} {:<14} {}",
-                        "INSTANCE_ID", "NAME", "REGION", "STATUS"
-                    );
-                    for s in servers {
-                        if let Some(n) = &name {
-                            if !s.name.contains(n.as_str()) {
-                                continue;
-                            }
-                        }
-                        println!("{:<24} {:<32} {:<14} {}", s.id, s.name, s.region, s.status);
+    if !project_errors.is_empty() {
+        anyhow::bail!("以下项目执行失败: {}", project_errors.join(", "));
+    }
+    Ok(())
+}
+
+/// 对单个项目的全部（或 --provider 指定的）服务商执行快照轮转。
+async fn run_project_rotate(
+    cfg: &config::Config,
+    project: &config::Project,
+    provider_filter: Option<&str>,
+    keep: usize,
+    wait_minutes: u64,
+) -> anyhow::Result<()> {
+    let kinds: Vec<&String> = match provider_filter {
+        Some(k) => {
+            if !project.providers.contains_key(k) {
+                anyhow::bail!("项目 {} 未配置服务商 {k:?}（可用: {}）", project.name,
+                    project.providers.keys().cloned().collect::<Vec<_>>().join(", "));
+            }
+            vec![project.providers.get_key_value(k).unwrap().0]
+        }
+        None => project.providers.keys().collect(),
+    };
+
+    let mut errors = Vec::new();
+    for kind in kinds {
+        println!("-- 服务商: {kind}");
+        if let Err(e) = run_provider_rotate(cfg, project, kind, keep, wait_minutes).await {
+            println!("服务商 {kind} 执行失败: {e:#}");
+            errors.push(kind.clone());
+        }
+    }
+    if !errors.is_empty() {
+        anyhow::bail!("服务商执行失败: {}", errors.join(", "));
+    }
+    Ok(())
+}
+
+/// 按服务商 kind 分发到具体实现（新服务商 = 在此加一个分支）。
+async fn run_provider_rotate(
+    cfg: &config::Config,
+    project: &config::Project,
+    kind: &str,
+    keep: usize,
+    wait_minutes: u64,
+) -> anyhow::Result<()> {
+    match kind {
+        "aliyun" => {
+            let pcfg = cfg.provider(project, kind)?;
+            let (ak, sk) = pcfg.aliyun_credentials()?;
+            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region);
+            rotate_provider(&provider, &cfg.notify, keep, wait_minutes).await
+        }
+        other => anyhow::bail!("服务商 {other:?} 尚未实现（目前仅支持: aliyun）"),
+    }
+}
+
+/// 对单服务商的全部实例执行轮转（只依赖 CloudProvider trait，与具体服务商无关）。
+async fn rotate_provider<P: CloudProvider + ?Sized>(
+    provider: &P,
+    notify_cfg: &config::NotifyConfig,
+    keep: usize,
+    wait_minutes: u64,
+) -> anyhow::Result<()> {
+    let servers = provider.list_servers().await?;
+    if servers.is_empty() {
+        println!("  无实例，跳过");
+        return Ok(());
+    }
+
+    let notifier = crate::notify::from_config(notify_cfg)?;
+    let mut errors = Vec::new();
+    for server in &servers {
+        println!("  -- 实例: {} ({})", server.name, server.id);
+        match ops::snapshot::rotate(
+            provider,
+            &server.id,
+            keep,
+            Duration::from_secs(wait_minutes * 60),
+        )
+        .await
+        {
+            Ok(summary) => {
+                print!("{}", summary.render());
+                // 通知渠道发送结果（失败不阻断主流程，避免告警本身导致退出码非零）
+                if let Some(n) = &notifier {
+                    let title = format!("快照轮转: {} 成功", summary.server_name);
+                    if let Err(e) = n.send(&title, &summary.render()).await {
+                        tracing::warn!("通知发送失败: {e}");
                     }
                 }
-                AliyunCmd::Snapshot(snapshot_cmd) => match snapshot_cmd {
-                    SnapshotCmd::List { instance } => {
-                        let snaps = provider.list_snapshots(&instance).await?;
-                        if snaps.is_empty() {
-                            println!("实例 {instance} 暂无快照");
-                        } else {
-                            println!(
-                                "{:<26} {:<36} {:<10} {}",
-                                "SNAPSHOT_ID", "NAME", "STATUS", "CREATED_AT"
-                            );
-                            for s in snaps {
-                                println!(
-                                    "{:<26} {:<36} {:<10} {}",
-                                    s.id,
-                                    s.name,
-                                    s.status.as_str(),
-                                    s.created_at.unwrap_or_default()
-                                );
-                            }
-                        }
-                    }
-                    SnapshotCmd::Create { instance, name } => {
-                        let name = name.unwrap_or_else(|| {
-                            ops::snapshot::default_snapshot_name("snap")
-                        });
-                        let id = provider.create_snapshot(&instance, &name).await?;
-                        println!("已创建快照: {id} ({name})");
-                    }
-                    SnapshotCmd::Rotate {
-                        instance,
-                        keep,
-                        wait_minutes,
-                    } => {
-                        let summary = ops::snapshot::rotate(
-                            &provider,
-                            &instance,
-                            keep,
-                            Duration::from_secs(wait_minutes * 60),
-                        )
-                        .await?;
-                        print!("{}", summary.render());
-                    }
-                },
+            }
+            Err(e) => {
+                println!("    实例 {} 轮转失败: {e:#}", server.name);
+                errors.push(server.name.clone());
             }
         }
+    }
+    if !errors.is_empty() {
+        anyhow::bail!("以下实例轮转失败: {}", errors.join(", "));
     }
     Ok(())
 }

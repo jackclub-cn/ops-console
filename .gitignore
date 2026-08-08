@@ -1,5 +1,6 @@
 /target
-config/providers.toml
+config/project.toml
+config/notify.toml
 *.log
 notify.env
 rotate-and-notify.sh
