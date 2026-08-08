@@ -1,0 +1,31 @@
+# 服务商凭据配置
+#
+# 推荐做法：AK/SK 通过环境变量注入（CI / systemd / cron 场景），本文件留空：
+#   export ALIYUN_ACCESS_KEY_ID=xxxx
+#   export ALIYUN_ACCESS_KEY_SECRET=xxxx
+#
+# 或直接填写在下面（注意：文件权限需 chmod 600，且不要提交到 git）
+#
+# 阿里云 RAM 子账号最小权限策略（SWAS 快照轮转）：
+# 注意：RAM Action 前缀是 swas-open:（不是 swas:），见官方 API 文档"授权信息"。
+# {
+#   "Version": "1",
+#   "Statement": [
+#     {
+#       "Effect": "Allow",
+#       "Action": [
+#         "swas-open:ListInstances",
+#         "swas-open:ListDisks",
+#         "swas-open:ListSnapshots",
+#         "swas-open:CreateSnapshot",
+#         "swas-open:DeleteSnapshot"
+#       ],
+#       "Resource": "*"
+#     }
+#   ]
+# }
+
+[aliyun]
+region = "cn-shenzhen"
+access_key_id = ""
+access_key_secret = ""

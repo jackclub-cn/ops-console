@@ -1,0 +1,217 @@
+//! 阿里云轻量应用服务器（SWAS / swas-openapi）API 封装。
+//!
+//! 产品文档：https://help.aliyun.com/zh/simple-application-server/
+//! endpoint: https://swas.{region}.aliyuncs.com
+//! API Version: 2020-06-01
+
+use super::sign::sign_params;
+use anyhow::{anyhow, Result};
+use serde::Deserialize;
+
+const SWAS_API_VERSION: &str = "2020-06-01";
+
+#[derive(Debug, Clone)]
+pub struct SwasClient {
+    access_key_id: String,
+    access_key_secret: String,
+    region: String,
+    http: reqwest::Client,
+}
+
+// ---------- 请求/响应模型 ----------
+
+#[derive(Debug, Deserialize)]
+pub struct ListInstancesResponse {
+    #[serde(rename = "Instances", default)]
+    pub instances: Vec<SwasInstance>,
+    #[serde(rename = "TotalCount", default)]
+    pub total_count: i32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SwasInstance {
+    #[serde(rename = "InstanceId")]
+    pub instance_id: String,
+    #[serde(rename = "InstanceName", default)]
+    pub instance_name: String,
+    #[serde(rename = "RegionId", default)]
+    pub region_id: String,
+    #[serde(rename = "Status", default)]
+    pub status: String,
+    #[serde(rename = "PublicIpAddress", default)]
+    pub public_ip: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListDisksResponse {
+    #[serde(rename = "Disks", default)]
+    pub disks: Vec<SwasDisk>,
+    #[serde(rename = "TotalCount", default)]
+    pub total_count: i32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SwasDisk {
+    #[serde(rename = "DiskId")]
+    pub disk_id: String,
+    /// System | Data
+    #[serde(rename = "DiskType", default)]
+    pub disk_type: String,
+    #[serde(rename = "DiskName", default)]
+    pub disk_name: String,
+    #[serde(rename = "Status", default)]
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListSnapshotsResponse {
+    #[serde(rename = "Snapshots", default)]
+    pub snapshots: Vec<SwasSnapshot>,
+    #[serde(rename = "TotalCount", default)]
+    pub total_count: i32,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct SwasSnapshot {
+    #[serde(rename = "SnapshotId")]
+    pub snapshot_id: String,
+    #[serde(rename = "SnapshotName", default)]
+    pub snapshot_name: String,
+    /// Creating | Available | Failed
+    #[serde(rename = "Status", default)]
+    pub status: String,
+    /// 创建进度（百分比字符串）
+    #[serde(rename = "Progress", default)]
+    pub progress: String,
+    #[serde(rename = "CreationTime", default)]
+    pub creation_time: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateSnapshotResponse {
+    #[serde(rename = "SnapshotId")]
+    pub snapshot_id: String,
+}
+
+// ---------- 客户端 ----------
+
+impl SwasClient {
+    pub fn new(access_key_id: &str, access_key_secret: &str, region: &str) -> Self {
+        Self {
+            access_key_id: access_key_id.to_string(),
+            access_key_secret: access_key_secret.to_string(),
+            region: region.to_string(),
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("构建 HTTP client 失败"),
+        }
+    }
+
+    /// 通用 RPC 调用：签名 + GET + 统一错误处理
+    async fn call<T: for<'de> Deserialize<'de>>(
+        &self,
+        action: &str,
+        extra: &[(&str, &str)],
+    ) -> Result<T> {
+        let params = sign_params(
+            &self.access_key_id,
+            &self.access_key_secret,
+            action,
+            SWAS_API_VERSION,
+            &self.region,
+            extra,
+        )?;
+
+        let query = params
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let url = format!("https://swas.{}.aliyuncs.com/?{}", self.region, query);
+
+        let resp = self.http.get(&url).send().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+
+        if !status.is_success() {
+            return Err(anyhow!(
+                "SWAS API HTTP {} ({}): {}",
+                status.as_u16(),
+                action,
+                truncate(&text, 500)
+            ));
+        }
+
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| anyhow!("响应解析失败 ({action}): {e} => {}", truncate(&text, 300)))?;
+
+        // 阿里云 RPC 风格：HTTP 200 也可能带业务错误码
+        if let Some(code) = value.get("Code").and_then(|c| c.as_str()) {
+            if !code.is_empty() && code != "Success" {
+                let msg = value
+                    .get("Message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or_default();
+                return Err(anyhow!("SWAS 业务错误 {code}: {msg}"));
+            }
+        }
+
+        serde_json::from_value(value).map_err(|e| anyhow!("响应反序列化失败 ({action}): {e}"))
+    }
+
+    pub async fn list_instances(&self) -> Result<Vec<SwasInstance>> {
+        let resp: ListInstancesResponse = self.call("ListInstances", &[]).await?;
+        Ok(resp.instances)
+    }
+
+    pub async fn list_snapshots(&self, instance_id: &str) -> Result<Vec<SwasSnapshot>> {
+        let resp: ListSnapshotsResponse =
+            self.call("ListSnapshots", &[("InstanceId", instance_id)]).await?;
+        Ok(resp.snapshots)
+    }
+
+    pub async fn list_disks(&self, instance_id: &str) -> Result<Vec<SwasDisk>> {
+        let resp: ListDisksResponse = self.call("ListDisks", &[("InstanceId", instance_id)]).await?;
+        Ok(resp.disks)
+    }
+
+    /// 创建快照：轻量快照是磁盘级，需先解析系统盘 DiskId
+    pub async fn create_snapshot(&self, instance_id: &str, name: &str) -> Result<String> {
+        let disks = self.list_disks(instance_id).await?;
+        let disk = disks
+            .iter()
+            .find(|d| d.disk_type == "System")
+            .or_else(|| disks.first())
+            .ok_or_else(|| anyhow!("实例 {instance_id} 没有可用的磁盘"))?;
+        tracing::info!(
+            "实例 {instance_id} 使用磁盘 {} ({}, {}) 创建快照",
+            disk.disk_id,
+            disk.disk_type,
+            disk.disk_name
+        );
+        let resp: CreateSnapshotResponse = self
+            .call(
+                "CreateSnapshot",
+                &[("DiskId", disk.disk_id.as_str()), ("SnapshotName", name)],
+            )
+            .await?;
+        Ok(resp.snapshot_id)
+    }
+
+    pub async fn delete_snapshot(&self, snapshot_id: &str) -> Result<()> {
+        // 删除成功返回 RequestId，无业务字段
+        let _: serde_json::Value = self.call("DeleteSnapshot", &[("SnapshotId", snapshot_id)]).await?;
+        Ok(())
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(max).collect();
+        format!("{t}...")
+    }
+}

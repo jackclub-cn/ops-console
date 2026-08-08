@@ -1,0 +1,5 @@
+/target
+config/providers.toml
+*.log
+notify.env
+rotate-and-notify.sh
