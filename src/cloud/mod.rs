@@ -15,6 +15,8 @@ pub struct Server {
     pub region: String,
     /// 服务商原始状态字符串（如 Running / stopped）
     pub status: String,
+    /// 到期时间（UTC）；按量付费等无到期概念的实例为 None
+    pub expired_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// 快照状态

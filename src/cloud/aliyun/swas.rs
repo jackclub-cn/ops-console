@@ -36,6 +36,9 @@ pub struct SwasInstance {
     pub instance_name: String,
     #[serde(rename = "Status", default)]
     pub status: String,
+    /// 到期时间（ISO8601 UTC，如 2026-09-01T16:00:00Z）；按量付费实例可能为空
+    #[serde(rename = "ExpiredTime", default)]
+    pub expired_time: String,
 }
 
 #[derive(Debug, Deserialize)]

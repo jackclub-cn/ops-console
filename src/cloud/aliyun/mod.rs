@@ -39,6 +39,14 @@ impl CloudProvider for AliyunProvider {
             .into_iter()
             .map(|i| {
                 let id = i.instance_id.clone();
+                // ExpiredTime 为 ISO8601（Z 结尾），解析失败视为无到期时间
+                let expired_at = if i.expired_time.is_empty() {
+                    None
+                } else {
+                    chrono::DateTime::parse_from_rfc3339(&i.expired_time)
+                        .ok()
+                        .map(|t| t.with_timezone(&chrono::Utc))
+                };
                 Server {
                     id,
                     name: if i.instance_name.is_empty() {
@@ -48,6 +56,7 @@ impl CloudProvider for AliyunProvider {
                     },
                     region: self.region.clone(),
                     status: i.status,
+                    expired_at,
                 }
             })
             .collect())

@@ -8,6 +8,7 @@
 
 - 多项目 × 多服务商配置（`config/project.yml`），一条命令遍历全部项目/服务商
 - 阿里云轻量服务器快照轮转：删旧建新，保留指定份数，自动等待就绪
+- 服务器到期提醒：命中 30/15/3 天阈值（可配置）或已过期时通知
 - 通知渠道抽象：钉钉机器人（加签 + 标题签名），可替换扩展
 - 凭据支持配置文件与环境变量双重注入（推荐环境变量，适配 CI / systemd / cron）
 
@@ -30,6 +31,10 @@ cp config/notify.yml.example config/notify.yml   # 可选，不需要通知可�
 # 指定项目 / 指定服务商
 ./target/release/ops-console --project demo snapshot --keep 2
 ./target/release/ops-console --provider aliyun snapshot --keep 2
+
+# 服务器到期提醒（默认 30/15/3 天阈值，可 --days 自定义）
+./target/release/ops-console expiry
+./target/release/ops-console expiry --days 60,30,7
 ```
 
 ## 配置
@@ -91,6 +96,9 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
   snapshot [--keep 2] [--wait-minutes 30]
                              快照轮转：遍历目标项目 × 服务商 × 全部实例，删旧建新
                              单项目/服务商/实例失败不阻断其余，最后汇总报错并退出非零
+  expiry [--days 30,15,3]
+                             服务器到期提醒：检查全部实例到期时间，命中阈值
+                             （或已过期）时输出并汇总发一条通知；无命中则不通知
 ```
 
 ## 快照轮转策略
@@ -127,6 +135,14 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
 }
 ```
 
+## 到期提醒策略
+
+1. 读取实例到期时间（阿里云 `ListInstances` 返回的 `ExpiredTime`，无需额外 API）
+2. 剩余天数向上取整；**精确命中**阈值（默认 30/15/3 天）或已过期（<= 0 天）时提醒
+3. 每天 cron 跑一次时，精确命中只有一天，天然不重复提醒；已过期则每次运行都提醒（紧急）
+4. 全部命中项汇总为**一条**通知发送（避免刷屏）；无命中不通知
+5. 按量付费等无到期时间的实例自动跳过
+
 ## cron 示例
 
 ```bash
@@ -135,6 +151,12 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
   /opt/ops-console/target/release/ops-console \
   --config /opt/ops-console/config \
   snapshot --keep 2 >> /var/log/ops-console.log 2>&1
+
+# 每日 09:00 检查服务器到期（30/15/3 天阈值），命中才通知
+0 9 * * * DINGTALK_WEBHOOK_URL=... DINGTALK_SECRET=... \
+  /opt/ops-console/target/release/ops-console \
+  --config /opt/ops-console/config \
+  expiry >> /var/log/ops-console.log 2>&1
 ```
 
 ## 架构
@@ -143,9 +165,12 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
 graph LR
     CLI[main.rs: clap CLI] --> C[config.rs: 项目/服务商/通知配置]
     CLI --> P[ops/snapshot.rs: 轮转业务逻辑]
+    CLI --> E[ops/expiry.rs: 到期提醒业务逻辑]
     P --> T[cloud::CloudProvider trait]
+    E --> T
     T --> A[cloud/aliyun: 阿里云实现]
     P --> N[notify::Notifier trait]
+    E --> N
     N --> D[notify/dingtalk: 钉钉实现]
 ```
 

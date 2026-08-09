@@ -3,10 +3,11 @@
 //! 用法示例：
 //!   ops-console projects
 //!   ops-console snapshot --keep 2
+//!   ops-console expiry --days 30,15,3
 //!   ops-console --project demo --provider aliyun snapshot --keep 2
 //!
 //! 未指定 --project 时遍历全部项目；未指定 --provider 时执行项目内全部服务商；
-//! snapshot 对目标范围内的全部实例执行轮转。
+//! snapshot / expiry 对目标范围内的全部实例执行。
 
 mod cloud;
 mod config;
@@ -62,6 +63,13 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         wait_minutes: u64,
     },
+
+    /// 服务器到期提醒：命中阈值（或已过期）时输出并通知
+    Expiry {
+        /// 提醒阈值（天），逗号分隔
+        #[arg(long, default_value = "30,15,3")]
+        days: String,
+    },
 }
 
 #[tokio::main]
@@ -103,6 +111,82 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             errors
+        }
+        Command::Expiry { days } => {
+            let thresholds: Vec<i64> = days
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    s.parse::<i64>()
+                        .map_err(|_| anyhow::anyhow!("--days 参数无效: {s:?}（格式如 30,15,3）"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            if thresholds.is_empty() {
+                anyhow::bail!("--days 至少需要一个阈值（如 30,15,3）");
+            }
+
+            let targets: Vec<&config::Project> = match cli.project.as_deref() {
+                Some(name) => vec![cfg.select_project(Some(name))?],
+                None => cfg.projects.iter().collect(),
+            };
+
+            // 汇总全部项目/服务商的命中提醒，最后发一条通知（避免刷屏）
+            let notifier = crate::notify::from_config(&cfg.notify)?;
+            let mut alerts: Vec<(String, String, ops::expiry::ExpiryAlert)> = Vec::new();
+            let mut errors = Vec::new();
+            for project in &targets {
+                println!("\n===== 项目: {} =====", project.name);
+                let kinds: Vec<&String> = match cli.provider.as_deref() {
+                    Some(k) => {
+                        if !project.providers.contains_key(k) {
+                            anyhow::bail!(
+                                "项目 {} 未配置服务商 {k:?}（可用: {}）",
+                                project.name,
+                                project.providers.keys().cloned().collect::<Vec<_>>().join(", ")
+                            );
+                        }
+                        vec![project.providers.get_key_value(k).unwrap().0]
+                    }
+                    None => project.providers.keys().collect(),
+                };
+                for kind in kinds {
+                    println!("-- 服务商: {kind}");
+                    match run_provider_expiry(&cfg, project, kind, &thresholds).await {
+                        Ok(list) => alerts.extend(
+                            list.into_iter()
+                                .map(|a| (project.name.clone(), kind.clone(), a)),
+                        ),
+                        Err(e) => {
+                            println!("服务商 {kind} 检查失败: {e:#}");
+                            errors.push(kind.clone());
+                        }
+                    }
+                }
+            }
+
+            if !alerts.is_empty() {
+                let text = ops::expiry::render(&alerts);
+                println!("{text}");
+                if let Some(n) = &notifier {
+                    let title = format!("服务器到期提醒: {} 台需关注", alerts.len());
+                    if let Err(e) = n.send(&title, &text).await {
+                        tracing::warn!("通知发送失败: {e}");
+                    }
+                }
+            } else {
+                let list = thresholds
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("全部实例均在安全期内（{list} 天内无到期）");
+            }
+
+            if !errors.is_empty() {
+                anyhow::bail!("以下服务商检查失败: {}", errors.join(", "));
+            }
+            Vec::new()
         }
     };
 
@@ -159,6 +243,24 @@ async fn run_provider_rotate(
             let (ak, sk) = pcfg.aliyun_credentials()?;
             let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region);
             rotate_provider(&provider, &cfg.notify, keep, wait_minutes).await
+        }
+        other => anyhow::bail!("服务商 {other:?} 尚未实现（目前仅支持: aliyun）"),
+    }
+}
+
+/// 按服务商 kind 分发到期检查（新服务商 = 在此加一个分支）。
+async fn run_provider_expiry(
+    cfg: &config::Config,
+    project: &config::Project,
+    kind: &str,
+    thresholds: &[i64],
+) -> anyhow::Result<Vec<ops::expiry::ExpiryAlert>> {
+    match kind {
+        "aliyun" => {
+            let pcfg = cfg.provider(project, kind)?;
+            let (ak, sk) = pcfg.aliyun_credentials()?;
+            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region);
+            ops::expiry::check(&provider, thresholds, chrono::Utc::now()).await
         }
         other => anyhow::bail!("服务商 {other:?} 尚未实现（目前仅支持: aliyun）"),
     }
