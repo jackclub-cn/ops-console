@@ -6,7 +6,7 @@
 
 ## 功能
 
-- 多项目 × 多服务商配置（`config/project.toml`），一条命令遍历全部项目/服务商
+- 多项目 × 多服务商配置（`config/project.yml`），一条命令遍历全部项目/服务商
 - 阿里云轻量服务器快照轮转：删旧建新，保留指定份数，自动等待就绪
 - 通知渠道抽象：钉钉机器人（加签 + 标题签名），可替换扩展
 - 凭据支持配置文件与环境变量双重注入（推荐环境变量，适配 CI / systemd / cron）
@@ -18,8 +18,8 @@
 cargo build --release
 
 # 准备配置（从示例复制后填写）
-cp config/project.toml.example config/project.toml
-cp config/notify.toml.example config/notify.toml   # 可选，不需要通知可省略
+cp config/project.yml.example config/project.yml
+cp config/notify.yml.example config/notify.yml   # 可选，不需要通知可省略
 
 # 查看项目
 ./target/release/ops-console projects
@@ -34,38 +34,38 @@ cp config/notify.toml.example config/notify.toml   # 可选，不需要通知可
 
 ## 配置
 
-### project.toml（项目与服务商）
+### project.yml（项目与服务商）
 
-`[[projects]]` 定义多个项目；每个项目下 `[projects.providers.<kind>]` 配置服务商，`key` 即服务商类型（`aliyun` / 未来的 `tencent` / `aws` ...）。
+YAML 文档根即项目数组，每个项目下 `providers.<kind>` 配置服务商，`key` 即服务商类型（`aliyun` / 未来的 `tencent` / `aws` ...）。
 
-```toml
-[[projects]]
-name = "demo"
-description = "示例项目"
-[projects.providers.aliyun]
-region = "cn-shenzhen"
-access_key_id = ""        # 留空则用环境变量
-access_key_secret = ""
+```yaml
+- name: demo
+  description: 示例项目
+  providers:
+    aliyun:
+      region: cn-shenzhen
+      access_key_id: ""        # 留空则用环境变量
+      access_key_secret: ""
 
-[[projects]]
-name = "prod"
-[projects.providers.aliyun]
-region = "cn-hangzhou"
-access_key_id = ""
-access_key_secret = ""
+- name: prod
+  providers:
+    aliyun:
+      region: cn-hangzhou
+      access_key_id: ""
+      access_key_secret: ""
 ```
 
-### notify.toml（通知渠道，可选）
+### notify.yml（通知渠道，可选）
 
 不存在此文件 = 不通知。
 
-```toml
-kind = "dingtalk"
-prefix = "【通知】"        # 标题签名，标记消息来源；空 = 不加
+```yaml
+kind: dingtalk
+prefix: "【通知】"        # 标题签名，标记消息来源；空 = 不加
 
-[dingtalk]
-webhook = ""              # 留空则用环境变量 DINGTALK_WEBHOOK_URL
-secret = ""               # 加签密钥，留空则用环境变量 DINGTALK_SECRET
+dingtalk:
+  webhook: ""              # 留空则用环境变量 DINGTALK_WEBHOOK_URL
+  secret: ""               # 加签密钥，留空则用环境变量 DINGTALK_SECRET
 ```
 
 ### 环境变量
@@ -81,7 +81,7 @@ secret = ""               # 加签密钥，留空则用环境变量 DINGTALK_SEC
 ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [选项]
 
 全局参数:
-  --config <目录>    配置目录（含 project.toml / notify.toml），默认 config/
+  --config <目录>    配置目录（含 project.yml / notify.yml），默认 config/
   --project <名>     目标项目，默认全部项目
   --provider <kind>  只执行指定服务商（如 aliyun），默认项目内全部服务商
   --log <级别>       error|warn|info|debug，默认 info

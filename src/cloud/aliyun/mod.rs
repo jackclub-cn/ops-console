@@ -33,10 +33,6 @@ fn map_status(s: &str) -> SnapshotStatus {
 
 #[async_trait::async_trait]
 impl CloudProvider for AliyunProvider {
-    fn name(&self) -> &'static str {
-        "aliyun"
-    }
-
     async fn list_servers(&self) -> Result<Vec<Server>> {
         let instances = self.swas.list_instances().await?;
         Ok(instances

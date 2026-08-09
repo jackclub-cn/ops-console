@@ -1,8 +1,9 @@
 # 项目与服务商配置（多项目，每项目可配多个服务商）
+# YAML 格式，文件根即项目数组。
 #
 # 用法：
-#   ops-console --project <name> aliyun instance list
-#   不传 --project 时使用第一个项目
+#   ops-console --project <name> snapshot --keep 2
+#   不传 --project 时遍历全部项目
 #
 # 凭据推荐通过环境变量注入（CI / systemd / cron 场景），不写进文件：
 #   export ALIYUN_ACCESS_KEY_ID=xxxx
@@ -27,20 +28,20 @@
 #   ]
 # }
 
-[[projects]]
-name = "demo"
-description = "示例项目：阿里云深圳轻量服务器快照轮转"
-# 每行一个服务商：key 即 kind（如 aliyun / tencent / aws ...），值即该服务商配置
-[projects.providers.aliyun]
-region = "cn-shenzhen"
-access_key_id = ""
-access_key_secret = ""
+- name: demo
+  description: 示例项目：阿里云深圳轻量服务器快照轮转
+  # 每行一个服务商：key 即 kind（如 aliyun / tencent / aws ...），值即该服务商配置
+  providers:
+    aliyun:
+      region: cn-shenzhen
+      access_key_id: ""
+      access_key_secret: ""
 
 # 第二个项目示例：同账号多区域 / 多项目隔离
-# [[projects]]
-# name = "prod"
-# description = "生产环境"
-# [projects.providers.aliyun]
-# region = "cn-hangzhou"
-# access_key_id = ""
-# access_key_secret = ""
+# - name: prod
+#   description: 生产环境
+#   providers:
+#     aliyun:
+#       region: cn-hangzhou
+#       access_key_id: ""
+#       access_key_secret: ""

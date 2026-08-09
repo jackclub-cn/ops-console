@@ -1,6 +1,8 @@
 /target
-config/project.toml
-config/notify.toml
+config/project.yml
+config/notify.yml
 *.log
 notify.env
 rotate-and-notify.sh
+
+.omc/

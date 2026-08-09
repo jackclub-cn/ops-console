@@ -1,4 +1,4 @@
-//! 配置加载：config/project.toml（项目+服务商）+ config/notify.toml（通知渠道）+ 环境变量覆盖。
+//! 配置加载：config/project.yml（项目+服务商）+ config/notify.yml（通知渠道）+ 环境变量覆盖。
 
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
@@ -28,16 +28,9 @@ pub struct Project {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
-    /// kind -> 服务商配置（如 `aliyun = { region = "cn-shenzhen", ... }`）
+    /// kind -> 服务商配置（如 `aliyun: { region: cn-shenzhen, ... }`）
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
-}
-
-/// project.toml 文档根：`[[projects]]` 数组（TOML 文档根必须是表，不能直接反序列化为 Vec）。
-#[derive(Debug, Clone, Deserialize)]
-struct ProjectsFile {
-    #[serde(default)]
-    projects: Vec<Project>,
 }
 
 /// 全部配置的解析结果。
@@ -72,25 +65,25 @@ pub struct DingTalkConfig {
 }
 
 impl Config {
-    /// 从配置目录加载：`<dir>/project.toml` + `<dir>/notify.toml`（可选）。
+    /// 从配置目录加载：`<dir>/project.yml` + `<dir>/notify.yml`（可选）。
     pub fn load(dir: &Path) -> Result<Self> {
-        let projects_path = dir.join("project.toml");
+        let projects_path = dir.join("project.yml");
         let text = std::fs::read_to_string(&projects_path)
             .map_err(|e| anyhow!("读取配置文件失败 {}: {e}", projects_path.display()))?;
-        let projects_file: ProjectsFile = toml::from_str(&text)
+        // YAML 文档根可以是数组，直接反序列化为项目列表
+        let mut projects: Vec<Project> = serde_yaml::from_str(&text)
             .map_err(|e| anyhow!("解析配置文件失败 {}: {e}", projects_path.display()))?;
-        let mut projects = projects_file.projects;
         if projects.is_empty() {
             return Err(anyhow!(
-                "{} 中没有配置任何项目（需要至少一个 [[projects]] 条目）",
+                "{} 中没有配置任何项目（需要至少一个项目条目）",
                 projects_path.display()
             ));
         }
 
-        // notify.toml 可选：不存在 = 不通知
-        let notify_path = dir.join("notify.toml");
+        // notify.yml 可选：不存在 = 不通知
+        let notify_path = dir.join("notify.yml");
         let mut notify: NotifyConfig = match std::fs::read_to_string(&notify_path) {
-            Ok(t) => toml::from_str(&t)
+            Ok(t) => serde_yaml::from_str(&t)
                 .map_err(|e| anyhow!("解析配置文件失败 {}: {e}", notify_path.display()))?,
             Err(_) => NotifyConfig::default(),
         };
@@ -172,7 +165,7 @@ impl ProviderConfig {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 anyhow!(
-                    "缺少阿里云 AccessKeyId：请填写 project.toml 或设置环境变量 ALIYUN_ACCESS_KEY_ID"
+                    "缺少阿里云 AccessKeyId：请填写 project.yml 或设置环境变量 ALIYUN_ACCESS_KEY_ID"
                 )
             })?;
         let secret = self
@@ -181,7 +174,7 @@ impl ProviderConfig {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 anyhow!(
-                    "缺少阿里云 AccessKeySecret：请填写 project.toml 或设置环境变量 ALIYUN_ACCESS_KEY_SECRET"
+                    "缺少阿里云 AccessKeySecret：请填写 project.yml 或设置环境变量 ALIYUN_ACCESS_KEY_SECRET"
                 )
             })?;
         Ok((id, secret))

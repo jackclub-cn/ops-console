@@ -26,17 +26,6 @@ pub enum SnapshotStatus {
     Unknown,
 }
 
-impl SnapshotStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            SnapshotStatus::Creating => "creating",
-            SnapshotStatus::Available => "available",
-            SnapshotStatus::Failed => "failed",
-            SnapshotStatus::Unknown => "unknown",
-        }
-    }
-}
-
 /// 统一的快照抽象
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -53,8 +42,6 @@ pub struct Snapshot {
 /// 具体服务商的差异被隔离在实现内部。
 #[async_trait::async_trait]
 pub trait CloudProvider: Send + Sync {
-    fn name(&self) -> &'static str;
-
     /// 列出该服务商下的所有服务器
     async fn list_servers(&self) -> anyhow::Result<Vec<Server>>;
 

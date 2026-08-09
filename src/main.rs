@@ -26,7 +26,7 @@ use crate::cloud::CloudProvider;
     long_about = "服务商运维系统\n\n起步：阿里云轻量服务器快照轮转\n扩展：实现 cloud::CloudProvider trait 即可接入新服务商"
 )]
 struct Cli {
-    /// 配置目录（内含 project.toml / notify.toml）
+    /// 配置目录（内含 project.yml / notify.yml）
     #[arg(long, default_value = "config")]
     config: String,
 

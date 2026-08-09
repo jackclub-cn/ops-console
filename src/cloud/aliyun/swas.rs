@@ -34,18 +34,16 @@ pub struct SwasInstance {
     pub instance_id: String,
     #[serde(rename = "InstanceName", default)]
     pub instance_name: String,
-    #[serde(rename = "RegionId", default)]
-    pub region_id: String,
     #[serde(rename = "Status", default)]
     pub status: String,
-    #[serde(rename = "PublicIpAddress", default)]
-    pub public_ip: String,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ListDisksResponse {
     #[serde(rename = "Disks", default)]
     pub disks: Vec<SwasDisk>,
+    /// 轻量实例磁盘最多 2 块（系统盘+数据盘），无需分页；保留字段供校验
+    #[allow(dead_code)]
     #[serde(rename = "TotalCount", default)]
     pub total_count: i32,
 }
@@ -59,8 +57,6 @@ pub struct SwasDisk {
     pub disk_type: String,
     #[serde(rename = "DiskName", default)]
     pub disk_name: String,
-    #[serde(rename = "Status", default)]
-    pub status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,14 +158,55 @@ impl SwasClient {
     }
 
     pub async fn list_instances(&self) -> Result<Vec<SwasInstance>> {
-        let resp: ListInstancesResponse = self.call("ListInstances", &[]).await?;
-        Ok(resp.instances)
+        self.paginate("ListInstances", &[], |resp: ListInstancesResponse| {
+            (resp.instances, resp.total_count)
+        })
+        .await
     }
 
     pub async fn list_snapshots(&self, instance_id: &str) -> Result<Vec<SwasSnapshot>> {
-        let resp: ListSnapshotsResponse =
-            self.call("ListSnapshots", &[("InstanceId", instance_id)]).await?;
-        Ok(resp.snapshots)
+        self.paginate("ListSnapshots", &[("InstanceId", instance_id)], |resp: ListSnapshotsResponse| {
+            (resp.snapshots, resp.total_count)
+        })
+        .await
+    }
+
+    /// 通用分页拉取：SWAS 默认每页 10 条，必须翻页才能取全（否则快照 >10 会漏删）。
+    /// `extract` 从单页响应中取出 `(数据, TotalCount)`，循环取到 TotalCount 为止。
+    async fn paginate<T, E>(
+        &self,
+        action: &str,
+        extra: &[(&str, &str)],
+        extract: impl Fn(E) -> (Vec<T>, i32),
+    ) -> Result<Vec<T>>
+    where
+        T: serde::de::DeserializeOwned,
+        E: serde::de::DeserializeOwned,
+    {
+        const PAGE_SIZE: i32 = 100; // SWAS 上限
+        let mut page = 1;
+        let mut out = Vec::new();
+        loop {
+            let page_str = page.to_string();
+            let size_str = PAGE_SIZE.to_string();
+            let params: Vec<(&str, &str)> = extra
+                .iter()
+                .copied()
+                .chain([
+                    ("PageNumber", page_str.as_str()),
+                    ("PageSize", size_str.as_str()),
+                ])
+                .collect();
+            let resp: E = self.call(action, &params).await?;
+            let (items, total) = extract(resp);
+            out.extend(items);
+            let fetched = out.len() as i32;
+            if fetched >= total {
+                break;
+            }
+            page += 1;
+        }
+        Ok(out)
     }
 
     pub async fn list_disks(&self, instance_id: &str) -> Result<Vec<SwasDisk>> {
