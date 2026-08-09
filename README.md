@@ -24,12 +24,12 @@ cp config/notify.yml.example config/notify.yml   # 可选，不需要通知可�
 # 查看项目
 ./target/release/ops-console projects
 
-# 快照轮转（保留 2 份）：全部项目 × 全部服务商
-./target/release/ops-console snapshot --instance <instance-id> --keep 2
+# 快照轮转（保留 2 份）：全部项目 × 全部服务商 × 全部实例
+./target/release/ops-console snapshot --keep 2
 
 # 指定项目 / 指定服务商
-./target/release/ops-console --project demo snapshot --instance <id> --keep 2
-./target/release/ops-console --provider aliyun snapshot --instance <id> --keep 2
+./target/release/ops-console --project demo snapshot --keep 2
+./target/release/ops-console --provider aliyun snapshot --keep 2
 ```
 
 ## 配置
@@ -87,10 +87,10 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
   --log <级别>       error|warn|info|debug，默认 info
 
 子命令:
-  projects                 列出所有项目
-  snapshot --instance <id> [--keep 2] [--wait-minutes 30]
-                          快照轮转：遍历目标项目 × 服务商，删旧建新
-                          单项目/服务商失败不阻断其余，最后汇总报错并退出非零
+  projects                   列出所有项目
+  snapshot [--keep 2] [--wait-minutes 30]
+                             快照轮转：遍历目标项目 × 服务商 × 全部实例，删旧建新
+                             单项目/服务商/实例失败不阻断其余，最后汇总报错并退出非零
 ```
 
 ## 快照轮转策略
@@ -134,7 +134,7 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
 0 3 * * * DINGTALK_WEBHOOK_URL=... DINGTALK_SECRET=... \
   /opt/ops-console/target/release/ops-console \
   --config /opt/ops-console/config \
-  snapshot --instance <id> --keep 2 >> /var/log/ops-console.log 2>&1
+  snapshot --keep 2 >> /var/log/ops-console.log 2>&1
 ```
 
 ## 架构

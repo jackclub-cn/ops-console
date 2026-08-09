@@ -1,11 +1,12 @@
 //! ops-console —— 服务商运维系统。
 //!
 //! 用法示例：
-//!   ops-console --project demo snapshot list --instance <id>
-//!   ops-console snapshot rotate --instance <id> --keep 2
-//!   ops-console --provider aliyun snapshot list --instance <id>
+//!   ops-console projects
+//!   ops-console snapshot --keep 2
+//!   ops-console --project demo --provider aliyun snapshot --keep 2
 //!
-//! 未指定 --project 时遍历全部项目；未指定 --provider 时执行项目内全部服务商。
+//! 未指定 --project 时遍历全部项目；未指定 --provider 时执行项目内全部服务商；
+//! snapshot 对目标范围内的全部实例执行轮转。
 
 mod cloud;
 mod config;
