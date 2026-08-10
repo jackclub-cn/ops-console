@@ -70,6 +70,26 @@ enum Command {
         #[arg(long, default_value = "30,15,3")]
         days: String,
     },
+
+    /// ECS 运维检查：自动快照策略 + 到期提醒（复用 aliyun 配置的凭据与地域）
+    Ecs {
+        #[command(subcommand)]
+        command: EcsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum EcsCommand {
+    /// 检查自动快照策略是否开启，未开启的实例汇总通知
+    #[command(name = "autosnapshot")]
+    AutoSnapshot,
+
+    /// 到期提醒：命中阈值（或已过期）时输出并通知
+    Expiry {
+        /// 提醒阈值（天），逗号分隔
+        #[arg(long, default_value = "30,15,3")]
+        days: String,
+    },
 }
 
 #[tokio::main]
@@ -188,6 +208,14 @@ async fn main() -> anyhow::Result<()> {
             }
             Vec::new()
         }
+        Command::Ecs { command } => match command {
+            EcsCommand::AutoSnapshot => {
+                run_ecs_autosnapshot(&cfg, cli.project.as_deref(), cli.provider.as_deref()).await?
+            }
+            EcsCommand::Expiry { days } => {
+                run_ecs_expiry(&cfg, cli.project.as_deref(), cli.provider.as_deref(), &days).await?
+            }
+        },
     };
 
     if !project_errors.is_empty() {
@@ -261,6 +289,213 @@ async fn run_provider_expiry(
             let (ak, sk) = pcfg.aliyun_credentials()?;
             let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region);
             ops::expiry::check(&provider, thresholds, chrono::Utc::now()).await
+        }
+        other => anyhow::bail!("服务商 {other:?} 尚未实现（目前仅支持: aliyun）"),
+    }
+}
+
+/// 目标项目列表（--project 过滤，默认全部）
+fn select_projects<'a>(
+    cfg: &'a config::Config,
+    name: Option<&str>,
+) -> anyhow::Result<Vec<&'a config::Project>> {
+    match name {
+        Some(n) => Ok(vec![cfg.select_project(Some(n))?]),
+        None => Ok(cfg.projects.iter().collect()),
+    }
+}
+
+/// 项目内目标服务商 kind 列表（--provider 过滤 + allowed 白名单；默认 allowed 内的全部）
+fn provider_kinds<'a>(
+    project: &'a config::Project,
+    filter: Option<&str>,
+    allowed: &[&str],
+) -> anyhow::Result<Vec<&'a String>> {
+    match filter {
+        Some(k) => {
+            if !allowed.contains(&k) {
+                anyhow::bail!(
+                    "服务商 {k:?} 不支持该命令（可用: {}）",
+                    allowed.join(", ")
+                );
+            }
+            if !project.providers.contains_key(k) {
+                anyhow::bail!(
+                    "项目 {} 未配置服务商 {k:?}（可用: {}）",
+                    project.name,
+                    project.providers.keys().cloned().collect::<Vec<_>>().join(", ")
+                );
+            }
+            Ok(vec![project.providers.get_key_value(k).unwrap().0])
+        }
+        None => Ok(project
+            .providers
+            .keys()
+            .filter(|k| allowed.contains(&k.as_str()))
+            .collect()),
+    }
+}
+
+/// ECS 自动快照策略检查：遍历项目 × aliyun 配置，未开启的实例汇总通知。
+async fn run_ecs_autosnapshot(
+    cfg: &config::Config,
+    project_filter: Option<&str>,
+    provider_filter: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    let targets = select_projects(cfg, project_filter)?;
+    let notifier = crate::notify::from_config(&cfg.notify)?;
+    let mut all: Vec<(String, String, ops::ecs::AutoSnapshotStatus)> = Vec::new();
+    let mut errors = Vec::new();
+
+    for project in &targets {
+        println!("\n===== 项目: {} =====", project.name);
+        let kinds = provider_kinds(project, provider_filter, &["aliyun"])?;
+        if kinds.is_empty() {
+            println!("  未配置 aliyun 服务商，跳过");
+            continue;
+        }
+        for kind in kinds {
+            println!("-- 服务商: {kind}");
+            match run_provider_ecs_autosnapshot(cfg, project, kind).await {
+                Ok(list) => all.extend(
+                    list.into_iter()
+                        .map(|s| (project.name.clone(), kind.clone(), s)),
+                ),
+                Err(e) => {
+                    println!("服务商 {kind} 检查失败: {e:#}");
+                    errors.push(kind.clone());
+                }
+            }
+        }
+    }
+
+    if !all.is_empty() {
+        println!("{}", ops::ecs::render_autosnapshot(&all));
+        // 只通知未开启的实例
+        let unprotected: Vec<_> = all
+            .iter()
+            .filter(|(_, _, s)| !s.protected())
+            .cloned()
+            .collect();
+        if !unprotected.is_empty() {
+            if let Some(n) = &notifier {
+                let title = format!("ECS 自动快照检查: {} 台未开启", unprotected.len());
+                let text = ops::ecs::render_autosnapshot(&unprotected);
+                if let Err(e) = n.send(&title, &text).await {
+                    tracing::warn!("通知发送失败: {e}");
+                }
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        anyhow::bail!("以下服务商检查失败: {}", errors.join(", "));
+    }
+    Ok(errors)
+}
+
+/// ECS 到期提醒：遍历项目 × aliyun 配置，命中阈值（或已过期）汇总通知。
+async fn run_ecs_expiry(
+    cfg: &config::Config,
+    project_filter: Option<&str>,
+    provider_filter: Option<&str>,
+    days: &str,
+) -> anyhow::Result<Vec<String>> {
+    let thresholds: Vec<i64> = days
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("--days 参数无效: {s:?}（格式如 30,15,3）"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if thresholds.is_empty() {
+        anyhow::bail!("--days 至少需要一个阈值（如 30,15,3）");
+    }
+
+    let targets = select_projects(cfg, project_filter)?;
+    let notifier = crate::notify::from_config(&cfg.notify)?;
+    let mut alerts: Vec<(String, String, ops::expiry::ExpiryAlert)> = Vec::new();
+    let mut errors = Vec::new();
+
+    for project in &targets {
+        println!("\n===== 项目: {} =====", project.name);
+        let kinds = provider_kinds(project, provider_filter, &["aliyun"])?;
+        if kinds.is_empty() {
+            println!("  未配置 aliyun 服务商，跳过");
+            continue;
+        }
+        for kind in kinds {
+            println!("-- 服务商: {kind}");
+            match run_provider_ecs_expiry(cfg, project, kind, &thresholds).await {
+                Ok(list) => alerts.extend(
+                    list.into_iter()
+                        .map(|a| (project.name.clone(), kind.clone(), a)),
+                ),
+                Err(e) => {
+                    println!("服务商 {kind} 检查失败: {e:#}");
+                    errors.push(kind.clone());
+                }
+            }
+        }
+    }
+
+    if !alerts.is_empty() {
+        let text = ops::expiry::render(&alerts);
+        println!("{text}");
+        if let Some(n) = &notifier {
+            let title = format!("ECS 到期提醒: {} 台需关注", alerts.len());
+            if let Err(e) = n.send(&title, &text).await {
+                tracing::warn!("通知发送失败: {e}");
+            }
+        }
+    } else {
+        let list = thresholds
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("全部 ECS 实例均在安全期内（{list} 天内无到期）");
+    }
+
+    if !errors.is_empty() {
+        anyhow::bail!("以下服务商检查失败: {}", errors.join(", "));
+    }
+    Ok(errors)
+}
+
+/// 单服务商自动快照检查（新服务商 = 在此加一个分支）。
+async fn run_provider_ecs_autosnapshot(
+    cfg: &config::Config,
+    project: &config::Project,
+    kind: &str,
+) -> anyhow::Result<Vec<ops::ecs::AutoSnapshotStatus>> {
+    match kind {
+        "aliyun" => {
+            let pcfg = cfg.provider(project, kind)?;
+            let (ak, sk) = pcfg.aliyun_credentials()?;
+            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region);
+            ops::ecs::check_auto_snapshot(provider.ecs()).await
+        }
+        other => anyhow::bail!("服务商 {other:?} 尚未实现（目前仅支持: aliyun）"),
+    }
+}
+
+/// 单服务商 ECS 到期检查（新服务商 = 在此加一个分支）。
+async fn run_provider_ecs_expiry(
+    cfg: &config::Config,
+    project: &config::Project,
+    kind: &str,
+    thresholds: &[i64],
+) -> anyhow::Result<Vec<ops::expiry::ExpiryAlert>> {
+    match kind {
+        "aliyun" => {
+            let pcfg = cfg.provider(project, kind)?;
+            let (ak, sk) = pcfg.aliyun_credentials()?;
+            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region);
+            let servers = provider.ecs().list_servers().await?;
+            Ok(ops::expiry::check_servers(servers, thresholds, chrono::Utc::now()))
         }
         other => anyhow::bail!("服务商 {other:?} 尚未实现（目前仅支持: aliyun）"),
     }

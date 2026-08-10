@@ -9,8 +9,8 @@
 #   export ALIYUN_ACCESS_KEY_ID=xxxx
 #   export ALIYUN_ACCESS_KEY_SECRET=xxxx
 #
-# 阿里云 RAM 子账号最小权限策略（SWAS 快照轮转）：
-# 注意：RAM Action 前缀是 swas-open:（不是 swas:），见官方 API 文档"授权信息"。
+# 阿里云 RAM 子账号最小权限策略（SWAS 快照轮转 + ECS 只读检查）：
+# 注意：SWAS 的 Action 前缀是 swas-open:（不是 swas:），见官方 API 文档"授权信息"。
 # {
 #   "Version": "1",
 #   "Statement": [
@@ -21,7 +21,10 @@
 #         "swas-open:ListDisks",
 #         "swas-open:ListSnapshots",
 #         "swas-open:CreateSnapshot",
-#         "swas-open:DeleteSnapshot"
+#         "swas-open:DeleteSnapshot",
+#         "ecs:DescribeInstances",
+#         "ecs:DescribeDisks",
+#         "ecs:DescribeAutoSnapshotPolicyEx"
 #       ],
 #       "Resource": "*"
 #     }

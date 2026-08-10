@@ -1,5 +1,7 @@
 //! 阿里云 provider 实现。
 
+pub mod ecs;
+pub mod rpc;
 pub mod sign;
 pub mod swas;
 
@@ -7,9 +9,12 @@ use crate::cloud::{CloudProvider, Server, Snapshot, SnapshotStatus};
 use anyhow::{anyhow, Result};
 use std::time::Duration;
 
+use self::rpc::parse_expired_time;
+
 pub struct AliyunProvider {
     region: String,
     swas: swas::SwasClient,
+    ecs: ecs::EcsClient,
 }
 
 impl AliyunProvider {
@@ -17,7 +22,13 @@ impl AliyunProvider {
         Self {
             region: region.to_string(),
             swas: swas::SwasClient::new(access_key_id, access_key_secret, region),
+            ecs: ecs::EcsClient::new(access_key_id, access_key_secret, region),
         }
+    }
+
+    /// ECS 客户端（自动快照策略检查 / 到期提醒用）
+    pub fn ecs(&self) -> &ecs::EcsClient {
+        &self.ecs
     }
 }
 
@@ -39,14 +50,6 @@ impl CloudProvider for AliyunProvider {
             .into_iter()
             .map(|i| {
                 let id = i.instance_id.clone();
-                // ExpiredTime 为 ISO8601（Z 结尾），解析失败视为无到期时间
-                let expired_at = if i.expired_time.is_empty() {
-                    None
-                } else {
-                    chrono::DateTime::parse_from_rfc3339(&i.expired_time)
-                        .ok()
-                        .map(|t| t.with_timezone(&chrono::Utc))
-                };
                 Server {
                     id,
                     name: if i.instance_name.is_empty() {
@@ -56,7 +59,7 @@ impl CloudProvider for AliyunProvider {
                     },
                     region: self.region.clone(),
                     status: i.status,
-                    expired_at,
+                    expired_at: parse_expired_time(&i.expired_time),
                 }
             })
             .collect())

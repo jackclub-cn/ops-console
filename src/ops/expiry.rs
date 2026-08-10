@@ -34,8 +34,17 @@ pub async fn check<P: CloudProvider + ?Sized>(
     thresholds: &[i64],
     now: DateTime<Utc>,
 ) -> Result<Vec<ExpiryAlert>> {
+    Ok(check_servers(provider.list_servers().await?, thresholds, now))
+}
+
+/// 纯逻辑：对服务器列表过滤命中提醒（ECS 等非 CloudProvider 客户端复用）。
+pub fn check_servers(
+    servers: Vec<Server>,
+    thresholds: &[i64],
+    now: DateTime<Utc>,
+) -> Vec<ExpiryAlert> {
     let mut alerts = Vec::new();
-    for server in provider.list_servers().await? {
+    for server in servers {
         // 无到期时间（按量付费等）跳过
         let Some(expired_at) = server.expired_at else { continue };
         let d = days_left(expired_at, now);
@@ -47,7 +56,7 @@ pub async fn check<P: CloudProvider + ?Sized>(
             });
         }
     }
-    Ok(alerts)
+    alerts
 }
 
 /// 渲染提醒列表：`项目/服务商 服务器名 (ID)：到期时间（北京时间），剩余 N 天 / 已过期 N 天`

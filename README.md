@@ -8,7 +8,8 @@
 
 - 多项目 × 多服务商配置（`config/project.yml`），一条命令遍历全部项目/服务商
 - 阿里云轻量服务器快照轮转：删旧建新，保留指定份数，自动等待就绪
-- 服务器到期提醒：命中 30/15/3 天阈值（可配置）或已过期时通知
+- 服务器到期提醒：命中 30/15/3 天阈值（可配置）或已过期时通知（SWAS + ECS）
+- ECS 自动快照策略检查：巡检实例磁盘是否绑定了自动快照策略，未开启的汇总通知
 - 通知渠道抽象：钉钉机器人（加签 + 标题签名），可替换扩展
 - 凭据支持配置文件与环境变量双重注入（推荐环境变量，适配 CI / systemd / cron）
 
@@ -35,6 +36,10 @@ cp config/notify.yml.example config/notify.yml   # 可选，不需要通知可�
 # 服务器到期提醒（默认 30/15/3 天阈值，可 --days 自定义）
 ./target/release/ops-console expiry
 ./target/release/ops-console expiry --days 60,30,7
+
+# ECS 运维检查（复用 aliyun 配置的凭据与地域）
+./target/release/ops-console ecs autosnapshot   # 自动快照策略是否开启
+./target/release/ops-console ecs expiry          # ECS 到期提醒
 ```
 
 ## 配置
@@ -99,6 +104,11 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
   expiry [--days 30,15,3]
                              服务器到期提醒：检查全部实例到期时间，命中阈值
                              （或已过期）时输出并汇总发一条通知；无命中则不通知
+  ecs autosnapshot
+                             ECS 自动快照策略检查：列出实例磁盘的绑定情况，
+                             未开启的实例汇总发一条通知；全部开启则不通知
+  ecs expiry [--days 30,15,3]
+                             ECS 到期提醒：同 expiry，作用于 ECS 实例
 ```
 
 ## 快照轮转策略
@@ -112,9 +122,15 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
 
 > 阿里云轻量限制：单台最多 3 个快照。`keep=2` 时轮转窗口 = 2 旧 + 1 新建中。
 
+## ECS 检查说明
+
+- 复用 `project.yml` 中 `aliyun` 配置的凭据与地域（ECS 与轻量同账号，无需新增配置）
+- 自动快照判断依据：`DescribeDisks` 返回每块云盘的 `AutoSnapshotPolicyId`，实例任一磁盘绑定了策略即视为已开启；同时展示策略详情（触发时间 / 周期 / 保留天数）
+- 到期时间来自 `DescribeInstances` 的 `ExpiredTime`，与 `expiry` 同一套阈值逻辑
+
 ## 阿里云 RAM 权限
 
-最小权限策略（注意 Action 前缀是 `swas-open:` 而非 `swas:`）：
+轻量（SWAS）最小权限策略（注意 Action 前缀是 `swas-open:` 而非 `swas:`）：
 
 ```json
 {
@@ -128,6 +144,25 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
         "swas-open:ListSnapshots",
         "swas-open:CreateSnapshot",
         "swas-open:DeleteSnapshot"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+ECS 只读检查最小权限策略：
+
+```json
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeInstances",
+        "ecs:DescribeDisks",
+        "ecs:DescribeAutoSnapshotPolicyEx"
       ],
       "Resource": "*"
     }
@@ -157,6 +192,12 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
   /opt/ops-console/target/release/ops-console \
   --config /opt/ops-console/config \
   expiry >> /var/log/ops-console.log 2>&1
+
+# 每日 10:00 ECS 自动快照巡检，未开启的实例才通知
+0 10 * * * DINGTALK_WEBHOOK_URL=... DINGTALK_SECRET=... \
+  /opt/ops-console/target/release/ops-console \
+  --config /opt/ops-console/config \
+  ecs autosnapshot >> /var/log/ops-console.log 2>&1
 ```
 
 ## 架构
@@ -166,15 +207,21 @@ graph LR
     CLI[main.rs: clap CLI] --> C[config.rs: 项目/服务商/通知配置]
     CLI --> P[ops/snapshot.rs: 轮转业务逻辑]
     CLI --> E[ops/expiry.rs: 到期提醒业务逻辑]
+    CLI --> A[ops/ecs.rs: ECS 自动快照检查]
     P --> T[cloud::CloudProvider trait]
     E --> T
-    T --> A[cloud/aliyun: 阿里云实现]
+    T --> SW[cloud/aliyun: SWAS 实现]
+    A --> EC[cloud/aliyun/ecs.rs: ECS 客户端]
+    SW --> R[cloud/aliyun/rpc.rs: RPC 公共客户端]
+    EC --> R
     P --> N[notify::Notifier trait]
     E --> N
+    A --> N
     N --> D[notify/dingtalk: 钉钉实现]
 ```
 
 - **服务商抽象**：`cloud::CloudProvider` 定义统一的 `Server` / `Snapshot` 模型，轮转逻辑只依赖 trait。接入新服务商 = 实现 trait + 一个 API 模块（参考 `cloud::aliyun`）。
+- **RPC 客户端复用**：`cloud/aliyun/rpc.rs` 封装签名 + HTTP + 分页 + 统一错误处理，SWAS 与 ECS 共用；换 `product` 前缀 + API Version 即可接入新产品。
 - **通知抽象**：`notify::Notifier` 统一 `send(title, text)`。接入 Slack / Telegram 等 = 实现 trait + 在 `notify::from_config` 加一个分支。
 - **签名复用**：`cloud/aliyun/sign.rs` 是通用阿里云 RPC V3 签名（HMAC-SHA1），SWAS / ECS / SLB / DNS 等任意 RPC 风格产品换 endpoint + Version + Action 即可复用。
 
