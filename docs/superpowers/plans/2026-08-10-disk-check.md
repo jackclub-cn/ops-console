@@ -367,6 +367,9 @@ mod tests {
         assert!(parse_points("bad").is_empty());
         // 缺 instanceId → 跳过该点
         assert!(parse_points(r#"[{"Average": 50.0}]"#).is_empty());
+        // 缺 Average（或数值非法）→ 跳过该点，不默认为 0
+        assert!(parse_points(r#"[{"instanceId":"i-1"}]"#).is_empty());
+        assert!(parse_points(r#"[{"instanceId":"i-1","Average":"91.2%"}]"#).is_empty());
     }
 }
 ```
@@ -444,7 +447,7 @@ impl CmsClient {
 
 /// 解析 DescribeMetricLast 的 Datapoints（JSON 数组字符串）为数据点列表。
 /// 元素字段：小写 `timestamp`/`userId`/`instanceId`，大写 `Minimum`/`Average`/`Maximum`，磁盘指标带 `device`。
-/// 兼容大小写变体；缺 instanceId 的点跳过；非法输入返回空列表。
+/// 兼容大小写变体；缺 instanceId 或缺数值（Average 链取不到）的点跳过，不默认为 0；非法输入返回空列表。
 fn parse_points(datapoints: &str) -> Vec<MetricPoint> {
     let arr: Vec<serde_json::Value> = match serde_json::from_str(datapoints) {
         Ok(a) => a,
@@ -469,8 +472,11 @@ fn parse_points(datapoints: &str) -> Vec<MetricPoint> {
             .get("Average")
             .or_else(|| p.get("average"))
             .or_else(|| p.get("Maximum"))
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+            .and_then(|v| v.as_f64());
+        let Some(average) = average else {
+            // 数值缺失/非法：跳过该点，避免下游误读为 0% 使用率
+            continue;
+        };
         out.push(MetricPoint {
             instance_id: instance_id.to_string(),
             device: device.to_string(),
@@ -539,7 +545,7 @@ pub struct AliyunProvider {
 
 - [ ] **步骤 5：运行测试验证通过**
 
-运行：`cargo test -p ops-console --lib cloud::aliyun`
+运行：`cargo test --bin ops-console cloud::aliyun`
 预期：PASS（cms 解析 + rpc + swas 全部）。
 
 - [ ] **步骤 6：Commit**
@@ -652,7 +658,7 @@ mod tests {
             mk_status("cache", None, 0, 0, ""),
         )];
         let text = render_disk(&over, &missing);
-        assert!(text.contains("web (i-web) 91.2% (已用 45.0G/50.0G) 系统盘"));
+        assert!(text.contains("web (i-web) 91.2% (已用 45.0 GB/50.0 GB 系统盘)"));
         assert!(text.contains("=== 数据缺失 ==="));
         assert!(text.contains("cache (i-cache) 无磁盘监控数据（疑似未装云监控插件）"));
 
@@ -837,7 +843,7 @@ pub mod disk;
 
 - [ ] **步骤 5：运行测试验证通过**
 
-运行：`cargo test -p ops-console --lib ops::disk`
+运行：`cargo test --bin ops-console ops::disk`
 预期：PASS（5 个测试）。
 
 - [ ] **步骤 6：Commit**
@@ -858,15 +864,19 @@ git commit -m "feat: 磁盘占用检查纯逻辑（判定/聚合/渲染）+ 单�
 
 - [ ] **步骤 1：实现 `check_swas_disk`**
 
-在 `src/ops/disk.rs` 中 `title` 函数之后追加：
+先在 `src/ops/disk.rs` 文件顶部的 `use` 区域（`use std::collections::HashMap;` 附近）追加：
 
 ```rust
-// ---------- 网络面 check 函数 ----------
-
 use crate::cloud::aliyun::cms::CmsClient;
 use crate::cloud::aliyun::ecs::EcsClient;
 use crate::cloud::aliyun::swas::SwasClient;
 use anyhow::Result;
+```
+
+再在 `title` 函数之后、测试模块之前追加：
+
+```rust
+// ---------- 网络面 check 函数 ----------
 
 /// 构建展示用 Server（region 留空：render 不使用）
 fn server_from(name: String, id: String, status: &str) -> Server {
@@ -998,8 +1008,6 @@ pub async fn check_ecs_disk(
 }
 ```
 
-注意：`use` 声明须放在文件顶部（与 `use crate::cloud::aliyun::cms::MetricPoint;` 一起），不要放在函数之间——把步骤 1 代码块里的 `use` 行移到文件顶部 `use std::collections::HashMap;` 附近。
-
 - [ ] **步骤 3：运行测试 + 编译验证**
 
 运行：`cargo test -p ops-console`
@@ -1053,19 +1061,25 @@ git commit -m "feat: 磁盘检查网络面（SWAS DescribeMonitorData / ECS 云�
             let mut errors = Vec::new();
             for project in &targets {
                 println!("\n===== 项目: {} =====", project.name);
-                // 轻量磁盘检查（kind=aliyun）
-                match run_provider_disk_swas(&cfg, project, "aliyun", threshold).await {
-                    Ok((o, m)) => {
-                        over.extend(
-                            o.into_iter().map(|s| (project.name.clone(), "aliyun".into(), s)),
-                        );
-                        missing.extend(
-                            m.into_iter().map(|s| (project.name.clone(), "aliyun".into(), s)),
-                        );
-                    }
-                    Err(e) => {
-                        println!("服务商 aliyun 磁盘检查失败: {e:#}");
-                        errors.push("aliyun".to_string());
+                // 轻量磁盘检查（kind=aliyun）：仅当未指定 --provider 或指定 aliyun 时执行（与下方 ECS 门控一致）
+                let do_swas = match cli.provider.as_deref() {
+                    Some(k) => k == "aliyun",
+                    None => project.providers.contains_key("aliyun"),
+                };
+                if do_swas {
+                    match run_provider_disk_swas(&cfg, project, "aliyun", threshold).await {
+                        Ok((o, m)) => {
+                            over.extend(
+                                o.into_iter().map(|s| (project.name.clone(), "aliyun".into(), s)),
+                            );
+                            missing.extend(
+                                m.into_iter().map(|s| (project.name.clone(), "aliyun".into(), s)),
+                            );
+                        }
+                        Err(e) => {
+                            println!("服务商 aliyun 磁盘检查失败: {e:#}");
+                            errors.push("aliyun".to_string());
+                        }
                     }
                 }
                 // ECS 磁盘检查：同账号凭据，kind 标记 aliyun-ecs；
