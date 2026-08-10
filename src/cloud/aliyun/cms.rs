@@ -61,7 +61,7 @@ impl CmsClient {
 
 /// 解析 DescribeMetricLast 的 Datapoints（JSON 数组字符串）为数据点列表。
 /// 元素字段：小写 `timestamp`/`userId`/`instanceId`，大写 `Minimum`/`Average`/`Maximum`，磁盘指标带 `device`。
-/// 兼容大小写变体；缺 instanceId 的点跳过；非法输入返回空列表。
+/// 兼容大小写变体；缺 instanceId 或缺数值（Average 链取不到）的点跳过，不默认为 0；非法输入返回空列表。
 fn parse_points(datapoints: &str) -> Vec<MetricPoint> {
     let arr: Vec<serde_json::Value> = match serde_json::from_str(datapoints) {
         Ok(a) => a,
@@ -82,12 +82,15 @@ fn parse_points(datapoints: &str) -> Vec<MetricPoint> {
             .or_else(|| p.get("Device"))
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        let average = p
+        let Some(average) = p
             .get("Average")
             .or_else(|| p.get("average"))
             .or_else(|| p.get("Maximum"))
             .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+        else {
+            // 缺数值：跳过该点，避免下游把缺值误读为 0% 使用率
+            continue;
+        };
         out.push(MetricPoint {
             instance_id: instance_id.to_string(),
             device: device.to_string(),
@@ -125,5 +128,9 @@ mod tests {
         assert!(parse_points("bad").is_empty());
         // 缺 instanceId → 跳过该点
         assert!(parse_points(r#"[{"Average": 50.0}]"#).is_empty());
+        // 缺数值（Average 链取不到）→ 跳过该点，不默认为 0
+        assert!(parse_points(r#"[{"instanceId":"i-1"}]"#).is_empty());
+        // 数值键存在但非数值（如字符串 "91.2%"）→ as_f64 为 None → 跳过
+        assert!(parse_points(r#"[{"instanceId":"i-1","Average":"91.2%"}]"#).is_empty());
     }
 }
