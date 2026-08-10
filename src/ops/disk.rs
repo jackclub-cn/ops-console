@@ -3,8 +3,11 @@
 //! 超阈值（默认 90%）与数据缺失（Running 但查不到监控数据，疑似未装云监控插件）
 //! 分别汇总，随 cron 每次运行都通知（无持久化，与 expiry 一致）。
 
-use crate::cloud::aliyun::cms::MetricPoint;
+use crate::cloud::aliyun::cms::{CmsClient, MetricPoint};
+use crate::cloud::aliyun::ecs::EcsClient;
+use crate::cloud::aliyun::swas::SwasClient;
 use crate::cloud::Server;
+use anyhow::Result;
 use std::collections::HashMap;
 
 /// 单个实例的磁盘占用状态
@@ -138,6 +141,131 @@ pub fn title(over: &[(String, String, DiskStatus)], missing: &[(String, String, 
     } else {
         format!("磁盘占用检查: {}", parts.join(", "))
     }
+}
+
+// ---------- 网络面 check 函数 ----------
+
+/// 构建展示用 Server（region 留空：render 不使用）
+fn server_from(name: String, id: String, status: &str) -> Server {
+    Server {
+        id,
+        name,
+        region: String::new(),
+        status: status.to_string(),
+        expired_at: None,
+    }
+}
+
+/// 查询单台轻量实例的磁盘用量：返回 (已用 bytes, 总 bytes, 来源描述)；无数据 → None。
+async fn disk_usage_swas(client: &SwasClient, instance_id: &str) -> Result<Option<(u64, u64, String)>> {
+    let used = match client.disk_usage_used(instance_id).await? {
+        Some(u) => u,
+        None => return Ok(None),
+    };
+    let disks = client.list_disks(instance_id).await?;
+    // 优先系统盘，退而求其次第一块盘
+    let disk = disks
+        .iter()
+        .find(|d| d.disk_type == "System")
+        .or_else(|| disks.first());
+    let Some(disk) = disk else { return Ok(None) };
+    if disk.size <= 0 {
+        return Ok(None);
+    }
+    let total = disk.size as u64 * 1024 * 1024 * 1024;
+    Ok(Some((used, total, "系统盘".to_string())))
+}
+
+/// SWAS 磁盘检查：只查 Running 实例；返回 (超阈值列表, 数据缺失列表)。
+/// 单实例查询失败 → println 告警并跳过（不归入缺失，避免把 API 错误误报成插件问题）。
+pub async fn check_swas_disk(
+    client: &SwasClient,
+    threshold: f64,
+) -> Result<(Vec<DiskStatus>, Vec<DiskStatus>)> {
+    let instances = client.list_instances().await?;
+    let total = instances.len();
+    let running: Vec<_> = instances.into_iter().filter(|i| i.status == "Running").collect();
+    println!("  轻量实例 {total} 台，跳过 {} 台非 Running", total - running.len());
+
+    let mut over = Vec::new();
+    let mut missing = Vec::new();
+    for inst in running {
+        let id = inst.instance_id.clone();
+        let name = if inst.instance_name.is_empty() {
+            id.clone()
+        } else {
+            inst.instance_name.clone()
+        };
+        match disk_usage_swas(client, &id).await {
+            Ok(Some((used, total_bytes, detail))) => {
+                let utilization = used as f64 / total_bytes as f64 * 100.0;
+                let status = DiskStatus {
+                    server: server_from(name.clone(), id.clone(), &inst.status),
+                    utilization: Some(utilization),
+                    used_bytes: used,
+                    total_bytes,
+                    detail,
+                };
+                if status.over(threshold) {
+                    over.push(status);
+                }
+            }
+            Ok(None) => missing.push(DiskStatus {
+                server: server_from(name.clone(), id.clone(), &inst.status),
+                utilization: None,
+                used_bytes: 0,
+                total_bytes: 0,
+                detail: String::new(),
+            }),
+            Err(e) => println!("    实例 {name} ({id}) 磁盘数据查询失败: {e:#}"),
+        }
+    }
+    Ok((over, missing))
+}
+
+/// ECS 磁盘检查：一次 DescribeMetricLast 拿地域内全部实例的 diskusage_utilization，
+/// 按 instanceId 聚合设备取最大；只查 Running 实例；返回 (超阈值, 数据缺失)。
+pub async fn check_ecs_disk(
+    client: &EcsClient,
+    cms: &CmsClient,
+    threshold: f64,
+) -> Result<(Vec<DiskStatus>, Vec<DiskStatus>)> {
+    let servers = client.list_servers().await?;
+    let total = servers.len();
+    let running: Vec<Server> = servers.into_iter().filter(|s| s.status == "Running").collect();
+    println!("  ECS 实例 {total} 台，跳过 {} 台非 Running", total - running.len());
+
+    let points = cms
+        .describe_metric_last("acs_ecs_dashboard", "diskusage_utilization", None)
+        .await?;
+    let agg = aggregate_by_instance(points);
+
+    let mut over = Vec::new();
+    let mut missing = Vec::new();
+    for server in running {
+        match agg.get(&server.id) {
+            Some(u) => {
+                let status = DiskStatus {
+                    server,
+                    utilization: Some(u.max),
+                    used_bytes: 0,
+                    total_bytes: 0,
+                    detail: format_devices(&u.devices),
+                };
+                if status.over(threshold) {
+                    over.push(status);
+                }
+            }
+            None => missing.push(DiskStatus {
+                server,
+                utilization: None,
+                used_bytes: 0,
+                total_bytes: 0,
+                detail: String::new(),
+            }),
+        }
+    }
+    Ok((over, missing))
 }
 
 #[cfg(test)]
