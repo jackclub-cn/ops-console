@@ -43,6 +43,36 @@ fn unmask_secret(submitted: &Option<String>, original: &Option<String>) -> Optio
     }
 }
 
+/// 在 orig 中定位提交项目的原项目：优先 _path（唯一稳定索引，改名后仍命中）；
+/// _path 缺省/为 null（异常）时 fallback 到按 name 匹配（保持旧行为）。
+/// _path 存在但无法匹配 → 视为新项目（返回 None，不还原掩码）。
+fn find_orig_project<'a>(orig: &'a [config::Project], path: Option<&str>, name: &str) -> Option<&'a config::Project> {
+    match path {
+        Some(p) => p.parse::<usize>().ok().and_then(|i| orig.get(i)),
+        None => orig.iter().find(|o| o.name == name),
+    }
+}
+
+/// 定位提交服务商的原服务商：优先 provider._path（"<项目_path>/<kind>"），
+/// 其次项目 _path + kind，最后 name + kind。定位不到返回 None（不还原）。
+fn find_orig_provider<'a>(
+    orig: &'a [config::Project],
+    proj_path: Option<&str>,
+    proj_name: &str,
+    kind: &str,
+    prov_path: Option<&str>,
+) -> Option<&'a config::ProviderConfig> {
+    if let Some(pp) = prov_path {
+        // provider._path 存在：拆出项目段与 kind 段，两者都匹配才还原
+        let (p, k) = pp.rsplit_once('/')?;
+        if k != kind {
+            return None;
+        }
+        return find_orig_project(orig, Some(p), proj_name).and_then(|op| op.providers.get(kind));
+    }
+    find_orig_project(orig, proj_path, proj_name).and_then(|op| op.providers.get(kind))
+}
+
 pub async fn get_config(State(state): State<AppState>) -> Response {
     match read_config_files(&state.config_dir) {
         Ok((projects, notify)) => {
@@ -56,8 +86,24 @@ pub async fn get_config(State(state): State<AppState>) -> Response {
             if !notify.dingtalk.secret.is_empty() {
                 notify.dingtalk.secret = SECRET_MASK.to_string();
             }
-            (StatusCode::OK, Json(serde_json::json!({"projects": projects, "notify": notify})))
-                .into_response()
+            // 附加稳定内部索引 _path：项目为下标（"0"、"1"...），服务商为 "<项目_path>/<kind>"，
+            // 供前端原样回传、服务端按索引还原掩码（改名/删建后仍能定位原值）。
+            let mut body = serde_json::json!({ "projects": projects, "notify": notify });
+            if let Some(arr) = body["projects"].as_array_mut() {
+                for (i, pv) in arr.iter_mut().enumerate() {
+                    if let Some(obj) = pv.as_object_mut() {
+                        obj.insert("_path".into(), serde_json::json!(i.to_string()));
+                        if let Some(providers) = obj.get_mut("providers").and_then(|v| v.as_object_mut()) {
+                            for (kind, pc) in providers.iter_mut() {
+                                if let Some(pc_obj) = pc.as_object_mut() {
+                                    pc_obj.insert("_path".into(), serde_json::json!(format!("{i}/{kind}")));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            (StatusCode::OK, Json(body)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -65,7 +111,8 @@ pub async fn get_config(State(state): State<AppState>) -> Response {
 
 #[derive(Deserialize)]
 pub struct ConfigPayload {
-    projects: Vec<config::Project>,
+    /// 用 Value 承接以保留各项目/服务商的 _path 字段（config::Project 不感知该字段）。
+    projects: Vec<serde_json::Value>,
     notify: config::NotifyConfig,
 }
 
@@ -75,15 +122,31 @@ pub async fn save_config(State(state): State<AppState>, Json(payload): Json<Conf
         Ok(v) => v,
         Err(_) => (Vec::new(), config::NotifyConfig::default()),
     };
-    let mut projects = payload.projects;
-    for p in &mut projects {
-        if let Some(orig) = orig_projects.iter().find(|o| o.name == p.name) {
-            for (kind, pc) in &mut p.providers {
-                if let Some(opc) = orig.providers.get(kind) {
-                    pc.access_key_secret = unmask_secret(&pc.access_key_secret, &opc.access_key_secret);
+    let mut projects: Vec<config::Project> = Vec::with_capacity(payload.projects.len());
+    for pv in payload.projects {
+        let proj_path = pv.get("_path").and_then(|v| v.as_str()).map(str::to_string);
+        let mut p: config::Project = match serde_json::from_value(pv.clone()) {
+            Ok(p) => p,
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("解析项目配置失败: {e}")).into_response(),
+        };
+        for (kind, pc) in &mut p.providers {
+            let prov_path = pv["providers"]
+                .get(kind)
+                .and_then(|v| v.get("_path"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            match find_orig_provider(&orig_projects, proj_path.as_deref(), &p.name, kind, prov_path.as_deref()) {
+                Some(opc) => pc.access_key_secret = unmask_secret(&pc.access_key_secret, &opc.access_key_secret),
+                None => {
+                    // 定位不到原值（新增项目/新增服务商）：不还原，直接存提交值；
+                    // 但提交值恰为掩码属异常，保守置空，绝不把掩码字面量写进文件。
+                    if pc.access_key_secret.as_deref() == Some(SECRET_MASK) {
+                        pc.access_key_secret = None;
+                    }
                 }
             }
         }
+        projects.push(p);
     }
     let mut notify = payload.notify;
     if notify.dingtalk.secret == SECRET_MASK {
@@ -261,6 +324,80 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let file = std::fs::read_to_string(st.config_dir.join("project.yml")).unwrap();
         assert!(file.contains("real-secret"), "掩码不应覆盖真实 secret: {file}");
+    }
+
+    #[tokio::test]
+    async fn test_config_get_adds_path_fields() {
+        let st = test_state();
+        let app = app(st.clone());
+        let res = app.oneshot(auth_req("GET", "/api/config", None)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["projects"][0]["_path"].as_str(), Some("0"), "GET 应附带项目 _path");
+        assert_eq!(
+            v["projects"][0]["providers"]["aliyun"]["_path"].as_str(),
+            Some("0/aliyun"),
+            "GET 应附带服务商 _path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_config_path_roundtrip_keeps_secret() {
+        let st = test_state();
+        let app = app(st.clone());
+        // GET 原样回传（含 _path 与掩码）→ 文件保留真实 secret
+        let res = app.clone().oneshot(auth_req("GET", "/api/config", None)).await.unwrap();
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let res = app.oneshot(auth_req("POST", "/api/config", Some(&v.to_string()))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let file = std::fs::read_to_string(st.config_dir.join("project.yml")).unwrap();
+        assert!(file.contains("real-secret"), "_path 往返后掩码不应覆盖真实 secret: {file}");
+        assert!(!file.contains(SECRET_MASK), "掩码字面量绝不应写入文件: {file}");
+    }
+
+    #[tokio::test]
+    async fn test_config_rename_with_path_keeps_secret() {
+        let st = test_state();
+        let app = app(st.clone());
+        let res = app.clone().oneshot(auth_req("GET", "/api/config", None)).await.unwrap();
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let mut v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // 改名但保留 _path → 掩码还原仍应命中原项目
+        v["projects"][0]["name"] = serde_json::json!("renamed");
+        let res = app.oneshot(auth_req("POST", "/api/config", Some(&v.to_string()))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let file = std::fs::read_to_string(st.config_dir.join("project.yml")).unwrap();
+        assert!(file.contains("renamed"), "改名应生效: {file}");
+        assert!(file.contains("real-secret"), "改名后掩码不应覆盖真实 secret: {file}");
+        assert!(!file.contains(SECRET_MASK), "掩码字面量绝不应写入文件: {file}");
+    }
+
+    #[tokio::test]
+    async fn test_config_new_provider_empty_secret_stored() {
+        let st = test_state();
+        let app = app(st.clone());
+        // 新增服务商（无 _path）+ 空 secret → 直接存提交值；已有 aliyun 掩码按 name fallback 还原
+        let body = r#"{"projects":[{"name":"demo","description":null,"providers":{"aliyun":{"region":"cn-shenzhen","access_key_id":null,"access_key_secret":"••••••••"},"tencent":{"region":"ap-guangzhou","access_key_id":null,"access_key_secret":""}}}],"notify":{"kind":"dingtalk","prefix":"【测试】","dingtalk":{"webhook":"https://example.com/hook","secret":""}}}"#;
+        let res = app.oneshot(auth_req("POST", "/api/config", Some(body))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let file = std::fs::read_to_string(st.config_dir.join("project.yml")).unwrap();
+        assert!(file.contains("tencent"), "新增服务商应写入: {file}");
+        assert!(file.contains("real-secret"), "aliyun 真实 secret 应保留: {file}");
+        assert!(!file.contains(SECRET_MASK), "掩码字面量绝不应写入文件: {file}");
+    }
+
+    #[tokio::test]
+    async fn test_config_stray_mask_not_written() {
+        let st = test_state();
+        let app = app(st.clone());
+        // 异常情况：_path 定位不到原值但提交了掩码 → 保守处理，绝不写掩码字面量
+        let body = r#"{"projects":[{"name":"ghost","description":null,"_path":"9","providers":{"aliyun":{"region":"cn-shenzhen","access_key_id":null,"access_key_secret":"••••••••"}}}],"notify":{"kind":"none"}}"#;
+        let res = app.oneshot(auth_req("POST", "/api/config", Some(body))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let file = std::fs::read_to_string(st.config_dir.join("project.yml")).unwrap();
+        assert!(!file.contains(SECRET_MASK), "掩码字面量绝不应写入文件: {file}");
     }
 
     #[tokio::test]

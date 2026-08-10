@@ -225,7 +225,16 @@ impl TaskManager {
             let mut store = self.store.lock().expect("task store");
             store.current = None;
             store.history.push(m.clone());
-            append_history(&self.config_dir, &m)?;
+            if let Err(e) = append_history(&self.config_dir, &m) {
+                // 历史写入失败不中断收尾：告警落日志 + 作为普通行广播，保证终态事件必然发出
+                tracing::warn!(task_id = %m.id, status, "追加历史到 jsonl 失败: {e:#}");
+                let msg = format!("警告: 历史记录写入失败: {e:#}");
+                let log_path = self.config_dir.join(&meta.output_file);
+                if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log_path) {
+                    let _ = writeln!(f, "{msg}");
+                }
+                self.emit(&msg);
+            }
         }
         self.emit(&format!("__status__ {status}"));
         Ok(())
@@ -398,6 +407,58 @@ mod tests {
         // 历史持久化到 jsonl
         let jsonl = std::fs::read_to_string(dir.join("ops-console-tasks.jsonl")).unwrap();
         assert!(jsonl.contains(&t.id));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_finish_emits_terminal_even_if_history_append_fails() {
+        let dir = std::env::temp_dir().join(format!("ops-console-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("project.yml"),
+            "- name: demo\n  providers:\n    aliyun:\n      region: cn-shenzhen\n",
+        )
+        .unwrap();
+        // 让 append_history 必然失败：在 jsonl 路径上创建目录（Windows/Unix 打开目录写均报错）
+        std::fs::create_dir(dir.join("ops-console-tasks.jsonl")).unwrap();
+        let mgr = TaskManager::new(&dir).unwrap();
+        let mut rx = mgr.tx.subscribe();
+        let spec = CommandSpec { command: "projects".into(), project: None, provider: None, extra: vec![] };
+        let meta = mgr.submit(spec).unwrap();
+
+        // 等待终态广播（libtest 子进程跑 CLI 会失败，但无论 success/failed 终态事件都必须发出）
+        let mut terminal: Option<String> = None;
+        for _ in 0..200 {
+            match rx.try_recv() {
+                Ok(line) => {
+                    if let Some(st) = line.strip_prefix("__status__ ") {
+                        if st == "success" || st == "failed" {
+                            terminal = Some(st.to_string());
+                            break;
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        let terminal = terminal.expect("append_history 失败时仍应广播终态事件");
+        assert!(terminal == "success" || terminal == "failed", "终态应为 success/failed: {terminal}");
+
+        // store.current 必须被清空，且历史中存在该任务的终态记录
+        for _ in 0..100 {
+            if mgr.current().is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(mgr.current().is_none(), "终态后 current 应被清空");
+        let hist = mgr.list();
+        let done = hist.iter().find(|t| t.id == meta.id);
+        assert!(done.is_some(), "历史应有该任务记录: {hist:?}");
+        assert_eq!(done.unwrap().status, terminal);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

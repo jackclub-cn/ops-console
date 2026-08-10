@@ -179,7 +179,7 @@ function selectProject(name) {
       <input class="form-control" id="projDesc" value="${esc(p.description || '')}"></div>
     <h6 class="mt-3">服务商</h6>`;
   Object.entries(p.providers || {}).forEach(([kind, pc]) => {
-    html += `<div class="border rounded p-2 mb-2 provider-block" data-kind="${kind}">
+    html += `<div class="border rounded p-2 mb-2 provider-block" data-kind="${kind}"${pc._path ? ` data-path="${esc(pc._path)}"` : ''}>
       <div class="d-flex justify-content-between"><strong>${kind}</strong>
         <button class="btn btn-sm btn-outline-danger del-provider">删除</button></div>
       <div class="row g-2 mt-1">
@@ -223,7 +223,7 @@ function selectProject(name) {
 }
 
 function collectProjects() {
-  // 当前编辑的项目从表单收集；其余项目保留原值
+  // 当前编辑的项目从表单收集（保留其 _path 与服务商 _path）；其余项目保留原值
   return window.__cfg.projects.map(p => {
     if (p.name !== currentProject) return p;
     const providers = {};
@@ -234,11 +234,15 @@ function collectProjects() {
         access_key_id: block.querySelector('.prov-ak').value,
         access_key_secret: block.querySelector('.prov-sk').value,
       };
+      // 渲染时保留的 _path 原样回传；新增服务商无 _path
+      if (block.dataset.path) providers[kind]._path = block.dataset.path;
     });
+    const orig = window.__cfg.projects.find(x => x.name === currentProject) || {};
     return {
       name: $('projName').value.trim(),
       description: $('projDesc').value || null,
       providers,
+      ...(orig._path ? { _path: orig._path } : {}),
     };
   });
 }
