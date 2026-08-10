@@ -168,6 +168,15 @@ fn server_from(name: String, id: String, status: &str) -> Server {
     }
 }
 
+/// 磁盘类型 → 中文标注（兼容真实 API 返回的小写变体 system/data）
+fn disk_type_label(disk_type: &str) -> String {
+    match disk_type.to_ascii_lowercase().as_str() {
+        "system" => "系统盘".to_string(),
+        "data" => "数据盘".to_string(),
+        other => format!("磁盘({other})"),
+    }
+}
+
 /// 查询单台轻量实例的磁盘用量：返回 (已用 bytes, 总 bytes, 来源描述)；无数据 → None。
 async fn disk_usage_swas(client: &SwasClient, instance_id: &str) -> Result<Option<(u64, u64, String)>> {
     let used = match client.disk_usage_used(instance_id).await? {
@@ -175,22 +184,17 @@ async fn disk_usage_swas(client: &SwasClient, instance_id: &str) -> Result<Optio
         None => return Ok(None),
     };
     let disks = client.list_disks(instance_id).await?;
-    // 优先系统盘，退而求其次第一块盘
+    // 优先系统盘（真实 API 返回小写 system），退而求其次第一块盘
     let disk = disks
         .iter()
-        .find(|d| d.disk_type == "System")
+        .find(|d| d.disk_type.eq_ignore_ascii_case("System"))
         .or_else(|| disks.first());
     let Some(disk) = disk else { return Ok(None) };
     if disk.size <= 0 {
         return Ok(None);
     }
     let total = disk.size as u64 * 1024 * 1024 * 1024;
-    // 按实际选中的磁盘类型标注（回退到非 System 盘时不误标为系统盘）
-    let detail = match disk.disk_type.as_str() {
-        "System" => "系统盘".to_string(),
-        "Data" => "数据盘".to_string(),
-        other => format!("磁盘({other})"),
-    };
+    let detail = disk_type_label(&disk.disk_type);
     Ok(Some((used, total, detail)))
 }
 
@@ -347,6 +351,15 @@ mod tests {
         // 设备名为空（非常规指标）→ 退化为 "系统盘 x.x%"
         let d = vec![("".to_string(), 95.0)];
         assert_eq!(format_devices(&d), "系统盘 95.0%");
+    }
+
+    #[test]
+    fn test_disk_type_label() {
+        assert_eq!(disk_type_label("System"), "系统盘");
+        assert_eq!(disk_type_label("system"), "系统盘"); // 真实 API 返回小写
+        assert_eq!(disk_type_label("Data"), "数据盘");
+        assert_eq!(disk_type_label("data"), "数据盘");
+        assert_eq!(disk_type_label("unknown"), "磁盘(unknown)");
     }
 
     #[test]

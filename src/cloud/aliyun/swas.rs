@@ -194,31 +194,35 @@ impl SwasClient {
     }
 }
 
-/// 解析 DescribeMonitorData 的 Datapoints（JSON 数组字符串），返回时间戳最新点的数值（bytes）。
-/// 元素数值字段兼容 `Value`/`value`/`Average`；时间戳兼容 `timestamp`/`Timestamp`（缺省按 0）。
+/// 解析 DescribeMonitorData 的 Datapoints（JSON 数组字符串），返回磁盘已用空间（bytes）。
+/// 元素数值字段兼容 `Value`/`value`/`Average`；时间戳兼容 `timestamp`/`Timestamp`。
+/// 策略：取最新时间戳，同一时刻可能返回多条序列（如多个分区的已用空间），取其中最大值。
 /// 空/非法/无数值字段 → None。
 fn parse_latest_usage(datapoints: &str) -> Option<u64> {
     let arr: Vec<serde_json::Value> = serde_json::from_str(datapoints).ok()?;
-    let mut best: Option<(i64, u64)> = None;
-    for p in arr {
-        let ts = p
-            .get("timestamp")
-            .or_else(|| p.get("Timestamp"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        let val = p
-            .get("Value")
-            .or_else(|| p.get("value"))
-            .or_else(|| p.get("Average"))
-            .and_then(|v| v.as_f64())
-            .map(|f| f as u64);
-        if let Some(v) = val {
-            if best.map_or(true, |(bt, _)| ts > bt) {
-                best = Some((ts, v));
-            }
-        }
-    }
-    best.map(|(_, v)| v)
+    let latest_ts = arr
+        .iter()
+        .filter_map(|p| {
+            p.get("timestamp")
+                .or_else(|| p.get("Timestamp"))
+                .and_then(|v| v.as_i64())
+        })
+        .max()?;
+    arr.iter()
+        .filter(|p| {
+            p.get("timestamp")
+                .or_else(|| p.get("Timestamp"))
+                .and_then(|v| v.as_i64())
+                == Some(latest_ts)
+        })
+        .filter_map(|p| {
+            p.get("Value")
+                .or_else(|| p.get("value"))
+                .or_else(|| p.get("Average"))
+                .and_then(|v| v.as_f64())
+                .map(|f| f as u64)
+        })
+        .max()
 }
 
 #[cfg(test)]
@@ -237,6 +241,14 @@ mod tests {
         // 取时间戳最新的点
         let s = r#"[{"timestamp": 1699219200, "Value": 1000}, {"timestamp": 1699219500, "Value": 2000}]"#;
         assert_eq!(parse_latest_usage(s), Some(2000));
+
+        // 同一时间戳多条序列（真实响应：同一时刻返回多个分区的已用空间）→ 取最大值
+        let s = r#"[{"timestamp": 1699219500, "Value": 6402048}, {"timestamp": 1699219500, "Value": 5707819008}]"#;
+        assert_eq!(parse_latest_usage(s), Some(5707819008));
+
+        // 旧时间戳数值更大也不取（只看最新时刻）
+        let s = r#"[{"timestamp": 1699219200, "Value": 999999999}, {"timestamp": 1699219500, "Value": 100}]"#;
+        assert_eq!(parse_latest_usage(s), Some(100));
 
         // 小写 value 兼容；缺 timestamp 按 0 处理
         let s = r#"[{"timestamp": 1699219500, "value": 3000}]"#;
