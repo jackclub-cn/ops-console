@@ -26,6 +26,10 @@ pub struct DiskStatus {
 
 impl DiskStatus {
     /// 数据缺失：Running 但查不到监控数据
+    ///
+    /// 设计文档规定的"数据缺失"语义访问器，由单元测试覆盖；
+    /// 生产侧缺失分支以 `utilization: None` 直接构造列表，故允许未使用。
+    #[allow(dead_code)]
     pub fn missing(&self) -> bool {
         self.utilization.is_none()
     }

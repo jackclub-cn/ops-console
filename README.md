@@ -148,7 +148,8 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
         "swas-open:ListDisks",
         "swas-open:ListSnapshots",
         "swas-open:CreateSnapshot",
-        "swas-open:DeleteSnapshot"
+        "swas-open:DeleteSnapshot",
+        "swas-open:DescribeMonitorData"
       ],
       "Resource": "*"
     }

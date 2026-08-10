@@ -228,19 +228,27 @@ async fn main() -> anyhow::Result<()> {
             let mut errors = Vec::new();
             for project in &targets {
                 println!("\n===== 项目: {} =====", project.name);
-                // 轻量磁盘检查（kind=aliyun）
-                match run_provider_disk_swas(&cfg, project, "aliyun", threshold).await {
-                    Ok((o, m)) => {
-                        over.extend(
-                            o.into_iter().map(|s| (project.name.clone(), "aliyun".into(), s)),
-                        );
-                        missing.extend(
-                            m.into_iter().map(|s| (project.name.clone(), "aliyun".into(), s)),
-                        );
-                    }
-                    Err(e) => {
-                        println!("服务商 aliyun 磁盘检查失败: {e:#}");
-                        errors.push("aliyun".to_string());
+                // 轻量磁盘检查：仅当未指定 --provider 或指定 aliyun 时执行（与 ECS 门控一致）
+                let do_swas = match cli.provider.as_deref() {
+                    Some(k) => k == "aliyun",
+                    None => project.providers.contains_key("aliyun"),
+                };
+                if do_swas {
+                    match run_provider_disk_swas(&cfg, project, "aliyun", threshold).await {
+                        Ok((o, m)) => {
+                            over.extend(
+                                o.into_iter()
+                                    .map(|s| (project.name.clone(), "aliyun".into(), s)),
+                            );
+                            missing.extend(
+                                m.into_iter()
+                                    .map(|s| (project.name.clone(), "aliyun".into(), s)),
+                            );
+                        }
+                        Err(e) => {
+                            println!("服务商 aliyun 磁盘检查失败: {e:#}");
+                            errors.push("aliyun".to_string());
+                        }
                     }
                 }
                 // ECS 磁盘检查：同账号凭据，kind 标记 aliyun-ecs；
