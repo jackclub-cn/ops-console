@@ -129,6 +129,10 @@ impl Config {
                 self.notify.dingtalk.secret = v;
             }
         }
+        // kind 推断：env 覆盖 webhook 之后补一次，保持旧 load 行为（纯 env 通知场景）
+        if self.notify.kind.is_empty() && !self.notify.dingtalk.webhook.is_empty() {
+            self.notify.kind = "dingtalk".to_string();
+        }
     }
 
     /// 取项目下指定 kind 的服务商配置；未配置返回错误。
@@ -289,6 +293,35 @@ mod tests {
         let saved: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(dir.join("serve.yml")).unwrap()).unwrap();
         assert_eq!(saved["token"].as_str().unwrap(), cfg.token);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_load_env_webhook_infers_dingtalk_kind() {
+        // notify.yml 缺失 + webhook 仅来自环境变量：load 后应推断 kind = dingtalk（保持旧行为）
+        let dir = std::env::temp_dir().join(format!("ops-console-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("project.yml"),
+            "- name: demo\n  providers:\n    aliyun:\n      region: cn-shenzhen\n",
+        )
+        .unwrap();
+
+        let prev = std::env::var("DINGTALK_WEBHOOK_URL").ok();
+        std::env::set_var(
+            "DINGTALK_WEBHOOK_URL",
+            "https://oapi.dingtalk.com/robot/send?access_token=test",
+        );
+        let cfg = Config::load(&dir).unwrap();
+        match prev {
+            Some(v) => std::env::set_var("DINGTALK_WEBHOOK_URL", v),
+            None => std::env::remove_var("DINGTALK_WEBHOOK_URL"),
+        }
+
+        assert_eq!(
+            cfg.notify.kind, "dingtalk",
+            "仅 env 提供 webhook 时应推断 kind=dingtalk（纯 env 通知场景）"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
