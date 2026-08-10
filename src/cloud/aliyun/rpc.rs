@@ -41,12 +41,24 @@ impl RpcClient {
         &self.region
     }
 
-    /// 通用 RPC 调用：签名 + GET + 统一错误处理
+    /// 通用 RPC 调用：签名 + GET + 统一错误处理（业务成功码："Success" 或空）
     pub async fn call<T: DeserializeOwned>(
         &self,
         action: &str,
         api_version: &str,
         extra: &[(&str, &str)],
+    ) -> Result<T> {
+        self.call_ok(action, api_version, extra, &[]).await
+    }
+
+    /// 同 [`call`]，但允许自定义业务成功码。
+    /// 云监控（cms）成功响应返回 `Code: "200"`（而非 "Success"），需传 `&["200"]`。
+    pub async fn call_ok<T: DeserializeOwned>(
+        &self,
+        action: &str,
+        api_version: &str,
+        extra: &[(&str, &str)],
+        ok_codes: &[&str],
     ) -> Result<T> {
         let params = sign_params(
             &self.access_key_id,
@@ -81,15 +93,8 @@ impl RpcClient {
         let value: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| anyhow!("响应解析失败 ({action}): {e} => {}", truncate(&text, 300)))?;
 
-        // 阿里云 RPC 风格：HTTP 200 也可能带业务错误码
-        if let Some(code) = value.get("Code").and_then(|c| c.as_str()) {
-            if !code.is_empty() && code != "Success" {
-                let msg = value
-                    .get("Message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or_default();
-                return Err(anyhow!("阿里云 {} 业务错误 {code}: {msg}", self.product));
-            }
+        if let Some(err) = business_error(&value, ok_codes) {
+            return Err(anyhow!("阿里云 {} 业务错误 {err}", self.product));
         }
 
         serde_json::from_value(value).map_err(|e| anyhow!("响应反序列化失败 ({action}): {e}"))
@@ -144,6 +149,22 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// 检查响应 JSON 是否携带业务错误。
+/// 返回 `Some(错误码[: 消息])` 表示失败；`None` 表示成功。
+/// 业务成功判定：无 Code 字段 / Code 为空 / Code == "Success" / Code 在 ok_codes 中。
+fn business_error(value: &serde_json::Value, ok_codes: &[&str]) -> Option<String> {
+    let code = value.get("Code").and_then(|c| c.as_str())?;
+    if code.is_empty() || code == "Success" || ok_codes.contains(&code) {
+        return None;
+    }
+    let msg = value.get("Message").and_then(|m| m.as_str()).unwrap_or_default();
+    if msg.is_empty() {
+        Some(code.to_string())
+    } else {
+        Some(format!("{code}: {msg}"))
+    }
+}
+
 /// 解析阿里云 ISO8601 到期时间（UTC）；空串/解析失败返回 None
 pub fn parse_expired_time(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     if s.is_empty() {
@@ -152,4 +173,35 @@ pub fn parse_expired_time(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_business_error() {
+        // Code=Success / 空 / 缺失 → 成功
+        assert_eq!(business_error(&serde_json::json!({"Code": "Success"}), &[]), None);
+        assert_eq!(business_error(&serde_json::json!({"Code": ""}), &[]), None);
+        assert_eq!(business_error(&serde_json::json!({"Datapoints": "[]"}), &[]), None);
+
+        // CMS 成功返回 Code="200"：默认判错误，传 ok_codes=["200"] 则成功
+        let v = serde_json::json!({"Code": "200", "Message": "The specified resource is not found."});
+        assert_eq!(
+            business_error(&v, &[]),
+            Some("200: The specified resource is not found.".to_string())
+        );
+        assert_eq!(business_error(&v, &["200"]), None);
+
+        // 普通业务错误
+        let v = serde_json::json!({"Code": "InvalidParameter", "Message": "bad param"});
+        assert_eq!(
+            business_error(&v, &[]),
+            Some("InvalidParameter: bad param".to_string())
+        );
+
+        // Message 缺失 → 只返回错误码
+        assert_eq!(business_error(&serde_json::json!({"Code": "Forbidden"}), &[]), Some("Forbidden".to_string()));
+    }
 }
