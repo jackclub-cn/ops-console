@@ -1,1 +1,147 @@
-<html><body>placeholder</body></html>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ops-console</title>
+<link rel="stylesheet" href="/static/bootstrap.min.css">
+<style>
+  body { background: #f5f6f8; }
+  .terminal { background: #1e1e1e; color: #d4d4d4; font-family: Consolas, Menlo, monospace;
+              font-size: 13px; border-radius: 6px; padding: 12px; height: 60vh; overflow-y: auto;
+              white-space: pre-wrap; word-break: break-all; }
+  .terminal .err { color: #f48771; }
+  .terminal .ok  { color: #89d185; }
+  .navbar-brand { font-weight: 600; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<nav class="navbar navbar-expand navbar-dark bg-dark">
+  <div class="container-fluid">
+    <a class="navbar-brand" href="#/run">ops-console</a>
+    <ul class="navbar-nav">
+      <li class="nav-item"><a class="nav-link" href="#/run" data-nav="run">运行命令</a></li>
+      <li class="nav-item"><a class="nav-link" href="#/config" data-nav="config">项目配置</a></li>
+      <li class="nav-item"><a class="nav-link" href="#/history" data-nav="history">运行历史</a></li>
+    </ul>
+    <span class="navbar-text text-muted small" id="loginState"></span>
+  </div>
+</nav>
+
+<!-- 登录页 -->
+<div id="page-login" class="container hidden" style="max-width: 420px; margin-top: 15vh;">
+  <div class="card shadow-sm">
+    <div class="card-body">
+      <h5 class="card-title">ops-console Web 管理</h5>
+      <p class="text-muted small">输入访问令牌（serve.yml 中配置，或启动时打印）</p>
+      <input type="password" id="loginToken" class="form-control mb-2" placeholder="访问令牌">
+      <button class="btn btn-primary w-100" id="loginBtn">登录</button>
+      <div id="loginErr" class="text-danger small mt-2"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 运行命令页 -->
+<div id="page-run" class="container-fluid hidden">
+  <div class="row g-3 mt-1">
+    <div class="col-lg-3">
+      <div class="card shadow-sm">
+        <div class="card-header">参数</div>
+        <div class="card-body">
+          <label class="form-label">命令</label>
+          <select id="cmdSelect" class="form-select mb-2">
+            <option value="projects">projects（列出项目）</option>
+            <option value="snapshot" selected>snapshot（快照轮转）</option>
+            <option value="expiry">expiry（到期提醒）</option>
+            <option value="disk">disk（磁盘检查）</option>
+          </select>
+          <label class="form-label">项目</label>
+          <select id="projectSelect" class="form-select mb-2"><option value="">全部项目</option></select>
+          <label class="form-label">服务商</label>
+          <select id="providerSelect" class="form-select mb-2"><option value="">全部</option></select>
+          <div id="extraParams"></div>
+          <button class="btn btn-primary w-100 mt-2" id="runBtn">▶ 运行</button>
+        </div>
+      </div>
+    </div>
+    <div class="col-lg-9">
+      <div class="card shadow-sm">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span>输出 <span id="runStatus" class="badge bg-secondary">未运行</span></span>
+          <button class="btn btn-sm btn-outline-secondary" id="clearOutBtn">清空</button>
+        </div>
+        <div class="card-body"><div class="terminal" id="output"></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 项目配置页 -->
+<div id="page-config" class="container-fluid hidden">
+  <div class="d-flex justify-content-between mt-2 mb-2">
+    <h5 class="m-0">项目配置</h5>
+    <div>
+      <button class="btn btn-outline-secondary btn-sm" id="toggleRaw">切换到 YAML 原文</button>
+      <button class="btn btn-primary btn-sm" id="saveCfgBtn">保存配置</button>
+    </div>
+  </div>
+  <div id="cfgForm" class="row g-3">
+    <div class="col-lg-3">
+      <div class="list-group" id="projectList"></div>
+      <button class="btn btn-outline-secondary btn-sm w-100 mt-2" id="addProjectBtn">+ 新增项目</button>
+    </div>
+    <div class="col-lg-9">
+      <div class="card shadow-sm"><div class="card-body" id="projectEditor"></div></div>
+      <div class="card shadow-sm mt-2">
+        <div class="card-header">通知设置（notify.yml）</div>
+        <div class="card-body">
+          <div class="row g-2">
+            <div class="col-2"><label class="form-label small">kind</label>
+              <select id="notifyKind" class="form-select form-select-sm">
+                <option value="">不通知</option><option value="none">none</option>
+                <option value="dingtalk">dingtalk</option></select></div>
+            <div class="col-2"><label class="form-label small">prefix（标题签名）</label>
+              <input id="notifyPrefix" class="form-control form-control-sm"></div>
+            <div class="col-4"><label class="form-label small">webhook</label>
+              <input id="notifyWebhook" class="form-control form-control-sm"></div>
+            <div class="col-4"><label class="form-label small">secret（加签密钥）</label>
+              <input type="password" id="notifySecret" class="form-control form-control-sm"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="cfgRaw" class="hidden">
+    <label class="form-label mt-2">project.yml</label>
+    <textarea id="rawProject" class="form-control font-monospace" rows="14" spellcheck="false"></textarea>
+    <label class="form-label mt-2">notify.yml</label>
+    <textarea id="rawNotify" class="form-control font-monospace" rows="8" spellcheck="false"></textarea>
+  </div>
+  <div id="cfgMsg" class="mt-2"></div>
+</div>
+
+<!-- 运行历史页 -->
+<div id="page-history" class="container-fluid hidden">
+  <div class="mt-2 mb-2"><h5 class="m-0">运行历史</h5></div>
+  <div class="card shadow-sm"><div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr><th>时间</th><th>命令</th><th>参数</th><th>状态</th><th>耗时</th><th></th></tr></thead>
+      <tbody id="historyBody"></tbody>
+    </table>
+  </div></div>
+</div>
+
+<!-- 历史输出模态框 -->
+<div class="modal fade" id="outModal" tabindex="-1"><div class="modal-dialog modal-lg modal-dialog-scrollable">
+  <div class="modal-content">
+    <div class="modal-header"><h6 class="modal-title" id="outModalTitle"></h6>
+      <button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+    <div class="modal-body"><div class="terminal" style="height:50vh" id="outModalBody"></div></div>
+  </div>
+</div></div>
+
+<script src="/static/bootstrap.bundle.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

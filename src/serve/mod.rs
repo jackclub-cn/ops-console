@@ -129,3 +129,48 @@ async fn require_auth(
         StatusCode::UNAUTHORIZED.into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    fn test_state() -> AppState {
+        let dir = std::env::temp_dir().join(format!("ops-console-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("project.yml"), "- name: demo\n  providers:\n    aliyun:\n      region: cn-shenzhen\n").unwrap();
+        let tasks = tasks::TaskManager::new(&dir).unwrap(); // 已返回 Arc<Self>
+        AppState {
+            config_dir: dir,
+            validator: auth::TokenValidator::new("tok"),
+            tasks,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_static_and_auth_routes() {
+        let state = test_state();
+        let dir = state.config_dir.clone();
+        let app = Router::new()
+            .route("/", get(serve_index))
+            .route("/static/{file}", get(serve_static))
+            .route("/api/tasks", axum::routing::get(api::list_tasks))
+            .with_state(state.clone())
+            .route_layer(middleware::from_fn_with_state(state, require_auth));
+
+        let idx = app.clone().oneshot(Request::builder().uri("/").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(idx.status(), StatusCode::OK);
+        let body = idx.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("ops-console"));
+
+        let css = app.clone().oneshot(Request::builder().uri("/static/bootstrap.min.css").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(css.status(), StatusCode::OK);
+
+        let noauth = app.clone().oneshot(Request::builder().uri("/api/tasks").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(noauth.status(), StatusCode::UNAUTHORIZED);
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
