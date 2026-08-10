@@ -94,12 +94,20 @@ function renderProviders(cfg, projectName) {
 }
 
 let es = null;
+// 当前提交的任务 id：status 事件按它过滤（排队场景下忽略前任务的终态）
+let currentTaskId = null;
 function startStream() {
   if (es) es.close();
   es = new EventSource(`/api/tasks/current/stream?token=${encodeURIComponent(TOKEN)}`);
   es.addEventListener('line', e => appendOut(e.data));
   es.addEventListener('status', e => {
-    const st = e.data;
+    // data 格式: "{task_id} {status}"（如 "abc123 success"）
+    const sp = e.data.indexOf(' ');
+    if (sp < 0) return;
+    const id = e.data.slice(0, sp);
+    const st = e.data.slice(sp + 1);
+    // 非当前任务的终态（如排队时前任务的结束）：忽略，不更新徽标、不关流、不启用按钮
+    if (id !== currentTaskId) return;
     const badge = $('runStatus');
     badge.textContent = st;
     badge.className = 'badge ' + (st === 'success' ? 'bg-success' : st === 'failed' ? 'bg-danger' : 'bg-primary');
@@ -131,13 +139,18 @@ async function runTask() {
   $('runBtn').disabled = true;
   $('runStatus').textContent = '排队中';
   $('runStatus').className = 'badge bg-secondary';
-  startStream();
+  // 先提交拿到 task_id，再开流：排队场景下 status 事件按 currentTaskId 过滤
   try {
-    await api('/api/run', { method: 'POST', body: JSON.stringify({ command, project, provider, extra }) });
+    const resp = await api('/api/run', { method: 'POST', body: JSON.stringify({ command, project, provider, extra }) });
+    currentTaskId = resp.task_id;
+    startStream();
   } catch (e) {
+    currentTaskId = null;
     appendOut('提交失败: ' + e.message);
     es && es.close(); es = null;
     $('runBtn').disabled = false;
+    $('runStatus').textContent = '失败';
+    $('runStatus').className = 'badge bg-danger';
   }
 }
 $('runBtn').onclick = runTask;

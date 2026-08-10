@@ -102,6 +102,11 @@ async fn main() -> anyhow::Result<()> {
         .compact()
         .init();
 
+    // serve 不依赖有效的 project.yml（UI 需引导首次配置/修复损坏配置），提前分发，避免 Config::load 失败阻断
+    if let Command::Serve { addr, token } = &cli.command {
+        return crate::serve::run(&std::path::PathBuf::from(&cli.config), addr, token.clone()).await;
+    }
+
     let cfg = config::Config::load(Path::new(&cli.config))?;
 
     let project_errors = match cli.command {
@@ -226,9 +231,8 @@ async fn main() -> anyhow::Result<()> {
             }
             Vec::new()
         }
-        Command::Serve { addr, token } => {
-            crate::serve::run(&std::path::PathBuf::from(&cli.config), &addr, token).await?;
-            Vec::new()
+        Command::Serve { .. } => {
+            unreachable!("Serve 已在 Config::load 之前分发，不应到达此处")
         }
         Command::Disk { threshold } => {
             if !(threshold > 0.0 && threshold <= 100.0) {

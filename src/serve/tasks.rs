@@ -139,7 +139,7 @@ impl TaskManager {
                 cur.meta.status = "running".into();
             }
         }
-        self.emit("__status__ running");
+        self.emit(&meta.id, "__status__ running");
         let started = Instant::now();
         let log_path = self.config_dir.join(&meta.output_file);
         let mut log = match std::fs::File::create(&log_path) {
@@ -180,11 +180,11 @@ impl TaskManager {
         while !(out_done && err_done) {
             tokio::select! {
                 line = out_lines.next_line(), if !out_done => match line {
-                    Ok(Some(l)) => self.push_line(&l, &mut log).await,
+                    Ok(Some(l)) => self.push_line(&meta.id, &l, &mut log).await,
                     _ => out_done = true,
                 },
                 line = err_lines.next_line(), if !err_done => match line {
-                    Ok(Some(l)) => self.push_line(&l, &mut log).await,
+                    Ok(Some(l)) => self.push_line(&meta.id, &l, &mut log).await,
                     _ => err_done = true,
                 },
             }
@@ -197,14 +197,15 @@ impl TaskManager {
         let _ = self.finish(meta, code, started, "").await;
     }
 
-    async fn push_line(&self, line: &str, log: &mut std::fs::File) {
+    async fn push_line(&self, task_id: &str, line: &str, log: &mut std::fs::File) {
         let _ = writeln!(log, "{line}");
         let _ = log.flush();
-        self.emit(line);
+        self.emit(task_id, line);
     }
 
-    fn emit(&self, line: &str) {
-        let _ = self.tx.send(line.to_string());
+    /// 广播消息格式："{task_id}\t{content}"（tab 分隔），供 SSE 按任务归属过滤。
+    fn emit(&self, task_id: &str, line: &str) {
+        let _ = self.tx.send(format!("{task_id}\t{line}"));
     }
 
     /// 收尾：写历史、更新状态、广播完成事件、追加 jsonl。
@@ -214,7 +215,7 @@ impl TaskManager {
             if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log_path) {
                 let _ = writeln!(f, "{error}");
             }
-            self.emit(error);
+            self.emit(&meta.id, error);
         }
         let status = if exit_code == Some(0) { "success" } else { "failed" };
         let mut m = meta.clone();
@@ -233,17 +234,27 @@ impl TaskManager {
                 if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log_path) {
                     let _ = writeln!(f, "{msg}");
                 }
-                self.emit(&msg);
+                self.emit(&meta.id, &msg);
             }
         }
-        self.emit(&format!("__status__ {status}"));
+        self.emit(&meta.id, &format!("__status__ {status}"));
         Ok(())
     }
 
-    /// SSE：订阅当前任务输出流。事件格式：`event: line/status`，data: 文本。
+    /// SSE：订阅任务输出流。事件格式：
+    /// - `event: task`，data = 当前任务 id（无任务时为空串），声明后续 tail 重放行归属；
+    /// - `event: line`，data = 输出行；
+    /// - `event: status`，data = "{task_id} {status}"（前端按任务 id 过滤，排队场景不误判）。
+    /// 流不因某个任务的终态而自行关闭：终态后如有排队任务继续广播，由前端收到匹配
+    /// 自己任务的终态后主动 es.close() 断开。
     pub async fn sse_current(&self) -> axum::response::Response {
         let rx = self.tx.subscribe();
         let store = self.store.lock().expect("task store");
+        let current_id = store
+            .current
+            .as_ref()
+            .map(|t| t.meta.id.clone())
+            .unwrap_or_default();
         let tail = match &store.current {
             Some(t) => {
                 let p = self.config_dir.join(&t.meta.output_file);
@@ -255,31 +266,50 @@ impl TaskManager {
         drop(store);
 
         let stream = async_stream::stream! {
+            // 先声明当前任务（无任务时 data 为空串），随后 tail 重放行属于该任务
+            yield Ok::<_, std::convert::Infallible>(Event::default().event("task").data(current_id.clone()));
             // 历史尾部（最后 200 行）
             for line in tail.lines().rev().take(200).collect::<Vec<_>>().into_iter().rev() {
-                yield Ok::<_, std::convert::Infallible>(Event::default().event("line").data(line.to_string()));
+                yield Ok(Event::default().event("line").data(line.to_string()));
             }
             if let Some(st) = &current_status {
-                yield Ok(Event::default().event("status").data(st.clone()));
+                yield Ok(Event::default().event("status").data(format!("{current_id} {st}")));
             }
             let mut rx = rx;
-            while let Ok(line) = rx.recv().await {
-                if let Some(st) = line.strip_prefix("__status__ ") {
-                    yield Ok(Event::default().event("status").data(st.to_string()));
-                    if st != "running" {
-                        break;
-                    }
+            while let Ok(msg) = rx.recv().await {
+                let Some((task_id, kind, payload)) = parse_broadcast(&msg) else { continue };
+                if kind == "status" {
+                    yield Ok(Event::default().event("status").data(format!("{task_id} {payload}")));
                 } else {
-                    yield Ok(Event::default().event("line").data(line));
+                    yield Ok(Event::default().event("line").data(payload));
                 }
             }
         };
         Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
     }
 
-    /// 读取历史任务完整输出。
+    /// 读取历史任务完整输出。id 必须是 32 位 hex（任务 id 恒为 uuid simple 格式），
+    /// 拒绝含路径分隔符 / .. 等任意非法 id，防路径穿越读取 tasks 目录外文件。
     pub fn read_output(&self, id: &str) -> Option<String> {
+        if id.len() != 32 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
         std::fs::read_to_string(self.config_dir.join("tasks").join(format!("{id}.log"))).ok()
+    }
+}
+
+/// 解析广播消息 "{task_id}\t{content}" → (task_id, kind, payload)。
+/// kind: "status"（content 以 "__status__ " 开头，payload 为状态名）| "line"（payload 为原行）。
+/// 无 tab 或 task_id 为空 → None（容错：不中断 SSE 流）。
+fn parse_broadcast(msg: &str) -> Option<(&str, &str, &str)> {
+    let (task_id, content) = msg.split_once('\t')?;
+    if task_id.is_empty() {
+        return None;
+    }
+    if let Some(st) = content.strip_prefix("__status__ ") {
+        Some((task_id, "status", st))
+    } else {
+        Some((task_id, "line", content))
     }
 }
 
@@ -411,6 +441,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_output_rejects_path_traversal() {
+        let dir = std::env::temp_dir().join(format!("ops-console-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("tasks")).unwrap();
+        // 合法 32-hex id（uuid simple 格式）→ 正常读取
+        let id: String = "0123456789abcdef".repeat(2);
+        std::fs::write(dir.join("tasks").join(format!("{id}.log")), "task output").unwrap();
+        // tasks 目录之外的文件：路径穿越必须被拒绝
+        std::fs::write(dir.join("probe.log"), "PROBE").unwrap();
+        let mgr = TaskManager::new(&dir).unwrap();
+        assert_eq!(mgr.read_output(&id).as_deref(), Some("task output"));
+        assert_eq!(mgr.read_output("../probe"), None, "路径穿越应被拒绝");
+        assert_eq!(mgr.read_output("../../probe"), None, "路径穿越应被拒绝");
+        assert_eq!(mgr.read_output("probe"), None, "非 32-hex id 应被拒绝");
+        assert_eq!(mgr.read_output(&format!("{id}/x")), None, "含 / 的 id 应被拒绝");
+        assert_eq!(mgr.read_output(&format!("{id}..")), None, "含 .. 的 id 应被拒绝");
+        assert_eq!(mgr.read_output(&"g".repeat(32)), None, "非 hex 字符应被拒绝");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_parse_broadcast() {
+        // 普通行
+        let (id, kind, payload) = parse_broadcast("abc123\tHello world").unwrap();
+        assert_eq!(id, "abc123");
+        assert_eq!(kind, "line");
+        assert_eq!(payload, "Hello world");
+        // __status__ 行
+        let (id, kind, payload) = parse_broadcast("abc123\t__status__ success").unwrap();
+        assert_eq!(id, "abc123");
+        assert_eq!(kind, "status");
+        assert_eq!(payload, "success");
+        let (_, kind, payload) = parse_broadcast("abc123\t__status__ running").unwrap();
+        assert_eq!(kind, "status");
+        assert_eq!(payload, "running");
+        // 无 tab 容错
+        assert!(parse_broadcast("no-tab-message").is_none());
+        // 空 task_id 容错
+        assert!(parse_broadcast("\t__status__ running").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_messages_carry_task_id() {
+        let dir = std::env::temp_dir().join(format!("ops-console-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("project.yml"),
+            "- name: demo\n  providers:\n    aliyun:\n      region: cn-shenzhen\n",
+        )
+        .unwrap();
+        let mgr = TaskManager::new(&dir).unwrap();
+        let mut rx = mgr.tx.subscribe();
+        let spec = CommandSpec { command: "projects".into(), project: None, provider: None, extra: vec![] };
+        let meta = mgr.submit(spec).unwrap();
+        mgr.run_next_if_idle().await.unwrap();
+        // 等待终态广播；期间所有消息必须带任务 id 前缀
+        let mut saw_running = false;
+        let mut saw_terminal = false;
+        for _ in 0..300 {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    assert!(
+                        msg.starts_with(&format!("{}\t", meta.id)),
+                        "广播消息应带任务 id 前缀: {msg:?}"
+                    );
+                    let (_, kind, payload) = parse_broadcast(&msg).unwrap();
+                    match kind {
+                        "status" => {
+                            if payload == "running" { saw_running = true; }
+                            if payload == "success" || payload == "failed" { saw_terminal = true; }
+                        }
+                        _ => {}
+                    }
+                    if saw_terminal { break; }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(saw_running && saw_terminal, "应收到 running 与终态广播（saw_running={saw_running}, saw_terminal={saw_terminal}）");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_sse_follows_queued_tasks() {
+        // 排队场景：任务 A 运行中提交 B。同一订阅者应依次收到 A 终态与 B 的
+        // running/终态（各自带任务 id），B 的事件不得因 A 终态而断流。
+        let dir = std::env::temp_dir().join(format!("ops-console-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("project.yml"),
+            "- name: demo\n  providers:\n    aliyun:\n      region: cn-shenzhen\n",
+        )
+        .unwrap();
+        let mgr = TaskManager::new(&dir).unwrap();
+        let mut rx = mgr.tx.subscribe();
+        let spec = CommandSpec { command: "projects".into(), project: None, provider: None, extra: vec![] };
+        let a = mgr.submit(spec.clone()).unwrap();
+        let b = mgr.submit(spec).unwrap();
+        let mut events: Vec<(String, String, String)> = Vec::new();
+        for _ in 0..600 {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    if let Some((id, kind, payload)) = parse_broadcast(&msg) {
+                        events.push((id.to_string(), kind.to_string(), payload.to_string()));
+                        if id == b.id && kind == "status"
+                            && (payload == "success" || payload == "failed")
+                        {
+                            break;
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        let statuses: Vec<(&str, &str)> = events
+            .iter()
+            .filter(|(_, k, _)| k == "status")
+            .map(|(i, _, p)| (i.as_str(), p.as_str()))
+            .collect();
+        let idx = |id: &str, st: &str| statuses.iter().position(|(i, s)| *i == id && *s == st);
+        assert!(idx(&a.id, "running").is_some(), "A 应有 running: {statuses:?}");
+        let a_term = idx(&a.id, "success").or_else(|| idx(&a.id, "failed"));
+        assert!(a_term.is_some(), "A 应有终态: {statuses:?}");
+        let b_run = idx(&b.id, "running");
+        assert!(b_run.is_some(), "B 应有 running: {statuses:?}");
+        let b_term = idx(&b.id, "success").or_else(|| idx(&b.id, "failed"));
+        assert!(b_term.is_some(), "B 应有终态: {statuses:?}");
+        // B 的 running 必须在 A 终态之后（单 worker FIFO），B 终态在 B running 之后
+        assert!(b_run.unwrap() > a_term.unwrap(), "B 的 running 应在 A 终态之后: {statuses:?}");
+        assert!(b_term.unwrap() > b_run.unwrap(), "B 的终态应在 B running 之后: {statuses:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn test_finish_emits_terminal_even_if_history_append_fails() {
         let dir = std::env::temp_dir().join(format!("ops-console-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -431,9 +601,9 @@ mod tests {
         for _ in 0..200 {
             match rx.try_recv() {
                 Ok(line) => {
-                    if let Some(st) = line.strip_prefix("__status__ ") {
-                        if st == "success" || st == "failed" {
-                            terminal = Some(st.to_string());
+                    if let Some((_, kind, payload)) = parse_broadcast(&line) {
+                        if kind == "status" && (payload == "success" || payload == "failed") {
+                            terminal = Some(payload.to_string());
                             break;
                         }
                     }
