@@ -1,5 +1,6 @@
 //! 阿里云 provider 实现。
 
+pub mod cms;
 pub mod ecs;
 pub mod rpc;
 pub mod sign;
@@ -15,6 +16,7 @@ pub struct AliyunProvider {
     region: String,
     swas: swas::SwasClient,
     ecs: ecs::EcsClient,
+    cms: cms::CmsClient,
 }
 
 impl AliyunProvider {
@@ -23,12 +25,23 @@ impl AliyunProvider {
             region: region.to_string(),
             swas: swas::SwasClient::new(access_key_id, access_key_secret, region),
             ecs: ecs::EcsClient::new(access_key_id, access_key_secret, region),
+            cms: cms::CmsClient::new(access_key_id, access_key_secret, region),
         }
+    }
+
+    /// SWAS 客户端（磁盘占用检查用）
+    pub fn swas(&self) -> &swas::SwasClient {
+        &self.swas
     }
 
     /// ECS 客户端（自动快照策略检查 / 到期提醒用）
     pub fn ecs(&self) -> &ecs::EcsClient {
         &self.ecs
+    }
+
+    /// 云监控客户端（ECS 磁盘使用率等操作系统监控指标）
+    pub fn cms(&self) -> &cms::CmsClient {
+        &self.cms
     }
 }
 
