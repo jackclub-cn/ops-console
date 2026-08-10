@@ -78,6 +78,16 @@ enum Command {
         #[arg(long, default_value_t = 90.0)]
         threshold: f64,
     },
+
+    /// 启动 Web 管理界面（配置管理 + 手动运行子命令）
+    Serve {
+        /// 监听地址（默认 127.0.0.1:8899）
+        #[arg(long, default_value = "127.0.0.1:8899")]
+        addr: String,
+        /// 访问令牌（默认: env OPS_CONSOLE_TOKEN > serve.yml，空则自动生成保存）
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -214,6 +224,10 @@ async fn main() -> anyhow::Result<()> {
             if !errors.is_empty() {
                 anyhow::bail!("以下服务商检查失败: {}", errors.join(", "));
             }
+            Vec::new()
+        }
+        Command::Serve { addr, token } => {
+            crate::serve::run(&std::path::PathBuf::from(&cli.config), &addr, token).await?;
             Vec::new()
         }
         Command::Disk { threshold } => {
@@ -587,3 +601,4 @@ async fn rotate_provider<P: CloudProvider + ?Sized>(
     }
     Ok(())
 }
+mod serve;
