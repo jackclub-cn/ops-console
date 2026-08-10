@@ -10,6 +10,7 @@
 - 阿里云轻量服务器快照轮转：删旧建新，保留指定份数，自动等待就绪
 - 服务器到期提醒：命中 30/15/3 天阈值（可配置）或已过期时通知（SWAS + ECS）
 - ECS 自动快照策略检查：巡检实例磁盘是否绑定了自动快照策略，随 `snapshot` 一起执行，未开启的汇总通知
+- 磁盘占用检查：SWAS（DescribeMonitorData）+ ECS（云监控 diskusage_utilization）使用率超阈值（默认 90%，--threshold 可配）或数据缺失时通知
 - 通知渠道抽象：钉钉机器人（加签 + 标题签名），可替换扩展
 - 凭据支持配置文件与环境变量双重注入（推荐环境变量，适配 CI / systemd / cron）
 
@@ -36,6 +37,10 @@ cp config/notify.yml.example config/notify.yml   # 可选，不需要通知可�
 # 服务器到期提醒（默认 30/15/3 天阈值，可 --days 自定义）
 ./target/release/ops-console expiry
 ./target/release/ops-console expiry --days 60,30,7
+
+# 磁盘占用检查（默认阈值 90%，可 --threshold 调整）
+./target/release/ops-console disk
+./target/release/ops-console disk --threshold 85
 
 # ECS 检查随 snapshot / expiry 一起执行，无需单独命令：
 #   snapshot  → 轮转 + ECS 自动快照策略检查
@@ -105,6 +110,10 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
   expiry [--days 30,15,3]
                              到期提醒：检查 SWAS + ECS 全部实例到期时间，命中阈值
                              （或已过期）时输出并汇总发一条通知；无命中则不通知
+  disk [--threshold 90]
+                             磁盘占用检查：SWAS + ECS 全部 Running 实例，
+                             使用率达到阈值或数据缺失时输出并汇总发一条通知
+                             （数据缺失 = Running 但查不到监控数据，疑似未装云监控插件）
 ```
 
 ## 快照轮转策略
@@ -158,7 +167,8 @@ ECS 只读检查最小权限策略：
       "Action": [
         "ecs:DescribeInstances",
         "ecs:DescribeDisks",
-        "ecs:DescribeAutoSnapshotPolicyEx"
+        "ecs:DescribeAutoSnapshotPolicyEx",
+        "cms:QueryMetricLast"
       ],
       "Resource": "*"
     }
@@ -188,6 +198,12 @@ ECS 只读检查最小权限策略：
   /opt/ops-console/target/release/ops-console \
   --config /opt/ops-console/config \
   expiry >> /var/log/ops-console.log 2>&1
+
+# 每 6 小时检查一次磁盘占用（默认阈值 90%）
+0 */6 * * * DINGTALK_WEBHOOK_URL=... DINGTALK_SECRET=... \
+  /opt/ops-console/target/release/ops-console \
+  --config /opt/ops-console/config \
+  disk >> /var/log/ops-console.log 2>&1
 ```
 
 ## 架构

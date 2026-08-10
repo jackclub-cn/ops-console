@@ -4,6 +4,7 @@
 //!   ops-console projects
 //!   ops-console snapshot --keep 2        # 快照轮转 + ECS 自动快照策略检查
 //!   ops-console expiry --days 30,15,3    # SWAS + ECS 到期提醒
+//!   ops-console disk --threshold 90      # SWAS + ECS 磁盘占用检查（超阈值/数据缺失通知）
 //!   ops-console --project demo --provider aliyun snapshot --keep 2
 //!
 //! 未指定 --project 时遍历全部项目；未指定 --provider 时执行项目内全部服务商；
@@ -69,6 +70,13 @@ enum Command {
         /// 提醒阈值（天），逗号分隔
         #[arg(long, default_value = "30,15,3")]
         days: String,
+    },
+
+    /// 磁盘占用检查：使用率超阈值（默认 90%）或数据缺失时输出并通知
+    Disk {
+        /// 磁盘使用率阈值（%），达到则告警
+        #[arg(long, default_value_t = 90.0)]
+        threshold: f64,
     },
 }
 
@@ -208,6 +216,77 @@ async fn main() -> anyhow::Result<()> {
             }
             Vec::new()
         }
+        Command::Disk { threshold } => {
+            if !(threshold > 0.0 && threshold <= 100.0) {
+                anyhow::bail!("--threshold 参数无效: {threshold}（范围 0 < 阈值 <= 100）");
+            }
+
+            let targets = select_projects(&cfg, cli.project.as_deref())?;
+            let notifier = crate::notify::from_config(&cfg.notify)?;
+            let mut over: Vec<(String, String, ops::disk::DiskStatus)> = Vec::new();
+            let mut missing: Vec<(String, String, ops::disk::DiskStatus)> = Vec::new();
+            let mut errors = Vec::new();
+            for project in &targets {
+                println!("\n===== 项目: {} =====", project.name);
+                // 轻量磁盘检查（kind=aliyun）
+                match run_provider_disk_swas(&cfg, project, "aliyun", threshold).await {
+                    Ok((o, m)) => {
+                        over.extend(
+                            o.into_iter().map(|s| (project.name.clone(), "aliyun".into(), s)),
+                        );
+                        missing.extend(
+                            m.into_iter().map(|s| (project.name.clone(), "aliyun".into(), s)),
+                        );
+                    }
+                    Err(e) => {
+                        println!("服务商 aliyun 磁盘检查失败: {e:#}");
+                        errors.push("aliyun".to_string());
+                    }
+                }
+                // ECS 磁盘检查：同账号凭据，kind 标记 aliyun-ecs；
+                // 仅当未指定 --provider 或指定 aliyun 时执行
+                let do_ecs = match cli.provider.as_deref() {
+                    Some(k) => k == "aliyun",
+                    None => project.providers.contains_key("aliyun"),
+                };
+                if do_ecs {
+                    match run_provider_disk_ecs(&cfg, project, "aliyun", threshold).await {
+                        Ok((o, m)) => {
+                            over.extend(
+                                o.into_iter()
+                                    .map(|s| (project.name.clone(), "aliyun-ecs".into(), s)),
+                            );
+                            missing.extend(
+                                m.into_iter()
+                                    .map(|s| (project.name.clone(), "aliyun-ecs".into(), s)),
+                            );
+                        }
+                        Err(e) => {
+                            println!("ECS 磁盘检查失败: {e:#}");
+                            errors.push("aliyun-ecs".to_string());
+                        }
+                    }
+                }
+            }
+
+            if !over.is_empty() || !missing.is_empty() {
+                let text = ops::disk::render_disk(&over, &missing);
+                println!("{text}");
+                if let Some(n) = &notifier {
+                    let title = ops::disk::title(&over, &missing);
+                    if let Err(e) = n.send(&title, &text).await {
+                        tracing::warn!("通知发送失败: {e}");
+                    }
+                }
+            } else {
+                println!("全部实例磁盘正常");
+            }
+
+            if !errors.is_empty() {
+                anyhow::bail!("以下服务商磁盘检查失败: {}", errors.join(", "));
+            }
+            Vec::new()
+        }
     };
 
     if !project_errors.is_empty() {
@@ -281,6 +360,42 @@ async fn run_provider_expiry(
             let (ak, sk) = pcfg.aliyun_credentials()?;
             let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region);
             ops::expiry::check(&provider, thresholds, chrono::Utc::now()).await
+        }
+        other => anyhow::bail!("服务商 {other:?} 尚未实现（目前仅支持: aliyun）"),
+    }
+}
+
+/// 按服务商 kind 分发轻量磁盘检查（新服务商 = 在此加一个分支）。
+async fn run_provider_disk_swas(
+    cfg: &config::Config,
+    project: &config::Project,
+    kind: &str,
+    threshold: f64,
+) -> anyhow::Result<(Vec<ops::disk::DiskStatus>, Vec<ops::disk::DiskStatus>)> {
+    match kind {
+        "aliyun" => {
+            let pcfg = cfg.provider(project, kind)?;
+            let (ak, sk) = pcfg.aliyun_credentials()?;
+            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region);
+            ops::disk::check_swas_disk(provider.swas(), threshold).await
+        }
+        other => anyhow::bail!("服务商 {other:?} 尚未实现（目前仅支持: aliyun）"),
+    }
+}
+
+/// 按服务商 kind 分发 ECS 磁盘检查（新服务商 = 在此加一个分支）。
+async fn run_provider_disk_ecs(
+    cfg: &config::Config,
+    project: &config::Project,
+    kind: &str,
+    threshold: f64,
+) -> anyhow::Result<(Vec<ops::disk::DiskStatus>, Vec<ops::disk::DiskStatus>)> {
+    match kind {
+        "aliyun" => {
+            let pcfg = cfg.provider(project, kind)?;
+            let (ak, sk) = pcfg.aliyun_credentials()?;
+            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region);
+            ops::disk::check_ecs_disk(provider.ecs(), provider.cms(), threshold).await
         }
         other => anyhow::bail!("服务商 {other:?} 尚未实现（目前仅支持: aliyun）"),
     }
