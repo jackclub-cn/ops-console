@@ -9,7 +9,7 @@
 - 多项目 × 多服务商配置（`config/project.yml`），一条命令遍历全部项目/服务商
 - 阿里云轻量服务器快照轮转：删旧建新，保留指定份数，自动等待就绪
 - 服务器到期提醒：命中 30/15/3 天阈值（可配置）或已过期时通知（SWAS + ECS）
-- ECS 自动快照策略检查：巡检实例磁盘是否绑定了自动快照策略，未开启的汇总通知
+- ECS 自动快照策略检查：巡检实例磁盘是否绑定了自动快照策略，随 `snapshot` 一起执行，未开启的汇总通知
 - 通知渠道抽象：钉钉机器人（加签 + 标题签名），可替换扩展
 - 凭据支持配置文件与环境变量双重注入（推荐环境变量，适配 CI / systemd / cron）
 
@@ -37,9 +37,9 @@ cp config/notify.yml.example config/notify.yml   # 可选，不需要通知可�
 ./target/release/ops-console expiry
 ./target/release/ops-console expiry --days 60,30,7
 
-# ECS 运维检查（复用 aliyun 配置的凭据与地域）
-./target/release/ops-console ecs autosnapshot   # 自动快照策略是否开启
-./target/release/ops-console ecs expiry          # ECS 到期提醒
+# ECS 检查随 snapshot / expiry 一起执行，无需单独命令：
+#   snapshot  → 轮转 + ECS 自动快照策略检查
+#   expiry    → SWAS + ECS 到期提醒
 ```
 
 ## 配置
@@ -99,16 +99,12 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
 子命令:
   projects                   列出所有项目
   snapshot [--keep 2] [--wait-minutes 30]
-                             快照轮转：遍历目标项目 × 服务商 × 全部实例，删旧建新
+                             快照轮转：遍历目标项目 × 服务商 × 全部实例，删旧建新；
+                             随后检查 ECS 自动快照策略（未开启的实例汇总通知）
                              单项目/服务商/实例失败不阻断其余，最后汇总报错并退出非零
   expiry [--days 30,15,3]
-                             服务器到期提醒：检查全部实例到期时间，命中阈值
+                             到期提醒：检查 SWAS + ECS 全部实例到期时间，命中阈值
                              （或已过期）时输出并汇总发一条通知；无命中则不通知
-  ecs autosnapshot
-                             ECS 自动快照策略检查：列出实例磁盘的绑定情况，
-                             未开启的实例汇总发一条通知；全部开启则不通知
-  ecs expiry [--days 30,15,3]
-                             ECS 到期提醒：同 expiry，作用于 ECS 实例
 ```
 
 ## 快照轮转策略
@@ -125,8 +121,8 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
 ## ECS 检查说明
 
 - 复用 `project.yml` 中 `aliyun` 配置的凭据与地域（ECS 与轻量同账号，无需新增配置）
-- 自动快照判断依据：`DescribeDisks` 返回每块云盘的 `AutoSnapshotPolicyId`，实例任一磁盘绑定了策略即视为已开启；同时展示策略详情（触发时间 / 周期 / 保留天数）
-- 到期时间来自 `DescribeInstances` 的 `ExpiredTime`，与 `expiry` 同一套阈值逻辑
+- 自动快照检查随 `snapshot` 执行：`DescribeDisks` 返回每块云盘的 `AutoSnapshotPolicyId`，实例任一磁盘绑定了策略即视为已开启；同时展示策略详情（触发时间 / 周期 / 保留天数）
+- 到期检查随 `expiry` 执行：到期时间来自 `DescribeInstances` 的 `ExpiredTime`，与 SWAS 同一套阈值逻辑，汇总渲染时以 `aliyun-ecs` 标记区分
 
 ## 阿里云 RAM 权限
 
@@ -192,12 +188,6 @@ ECS 只读检查最小权限策略：
   /opt/ops-console/target/release/ops-console \
   --config /opt/ops-console/config \
   expiry >> /var/log/ops-console.log 2>&1
-
-# 每日 10:00 ECS 自动快照巡检，未开启的实例才通知
-0 10 * * * DINGTALK_WEBHOOK_URL=... DINGTALK_SECRET=... \
-  /opt/ops-console/target/release/ops-console \
-  --config /opt/ops-console/config \
-  ecs autosnapshot >> /var/log/ops-console.log 2>&1
 ```
 
 ## 架构
