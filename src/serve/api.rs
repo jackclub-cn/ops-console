@@ -1,6 +1,6 @@
 //! 配置管理 API：登录、结构化配置读写、YAML 原文读写、任务提交与查询。
 
-use super::{AppState, auth, require_auth, tasks};
+use super::{AppState, tasks};
 use crate::config::{self, Config};
 use axum::{
     extract::State,
@@ -169,6 +169,7 @@ pub async fn task_output(State(state): State<AppState>, axum::extract::Path(id):
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serve::{auth, require_auth};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use axum::middleware;
