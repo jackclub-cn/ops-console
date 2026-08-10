@@ -1,6 +1,6 @@
 [package]
 name = "ops-console"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "服务商运维系统：多服务商统一运维抽象（快照轮转起步）"
 
