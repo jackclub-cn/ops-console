@@ -6,3 +6,6 @@ notify.env
 rotate-and-notify.sh
 
 .omc/
+
+# 子代理运行时产物
+.pi-subagents/
