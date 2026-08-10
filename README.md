@@ -47,6 +47,20 @@ cp config/notify.yml.example config/notify.yml   # 可选，不需要通知可�
 #   expiry    → SWAS + ECS 到期提醒
 ```
 
+## Web 管理界面
+
+```bash
+./target/release/ops-console serve                 # 默认 127.0.0.1:8899
+./target/release/ops-console serve --addr 0.0.0.0:8899 --token mytoken
+```
+
+- 打开 http://127.0.0.1:8899 输入访问令牌登录
+- 令牌优先级：`--token` 参数 > 环境变量 `OPS_CONSOLE_TOKEN` > `config/serve.yml`；三者皆空时自动生成随机令牌并写入 `config/serve.yml`
+- 功能：
+  - **运行命令**：选择命令（projects/snapshot/expiry/disk）+ 项目/服务商 + 参数，实时流式查看输出（SSE）
+  - **项目配置**：表单增删改项目/服务商/凭据与通知设置；右上角可切换 YAML 原文编辑；保存前自动校验
+  - **运行历史**：单 worker 串行执行，历史持久化在 `<config>/ops-console-tasks.jsonl` + `<config>/tasks/<id>.log`，重启可查
+
 ## 配置
 
 ### project.yml（项目与服务商）
