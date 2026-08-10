@@ -79,7 +79,7 @@ async function refreshProjects() {
     const sel = $('projectSelect');
     const cur = sel.value;
     sel.innerHTML = '<option value="">全部项目</option>' +
-      cfg.projects.map(p => `<option value="${p.name}">${p.name}</option>`).join('');
+      cfg.projects.map(p => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('');
     sel.value = cur;
     renderProviders(cfg, cur);
   } catch (e) { /* 未登录等情况由 api() 处理 */ }
@@ -90,7 +90,7 @@ $('projectSelect').onchange = () => {
 function renderProviders(cfg, projectName) {
   const p = cfg.projects.find(x => x.name === projectName);
   $('providerSelect').innerHTML = '<option value="">全部</option>' +
-    (p ? Object.keys(p.providers).map(k => `<option value="${k}">${k}</option>`).join('') : '');
+    (p ? Object.keys(p.providers).map(k => `<option value="${esc(k)}">${esc(k)}</option>`).join('') : '');
 }
 
 let es = null;
@@ -99,6 +99,8 @@ let currentTaskId = null;
 function startStream() {
   if (es) es.close();
   es = new EventSource(`/api/tasks/current/stream?token=${encodeURIComponent(TOKEN)}`);
+  let esOpened = false;
+  es.onopen = () => { esOpened = true; };
   es.addEventListener('line', e => appendOut(e.data));
   es.addEventListener('status', e => {
     // data 格式: "{task_id} {status}"（如 "abc123 success"）
@@ -116,7 +118,11 @@ function startStream() {
       $('runBtn').disabled = false;
     }
   });
-  es.onerror = () => { /* SSE 断线由浏览器自动重连 */ };
+  es.onerror = () => {
+    // 从未建立过连接即报错 → 大概率 401（token 失效/未登录）：跳登录页
+    if (!esOpened) { es.close(); es = null; showLogin(); }
+    // 已建立过连接后的断线由浏览器自动重连
+  };
 }
 
 function appendOut(text) {
@@ -172,7 +178,7 @@ async function loadConfig() {
 
 function renderProjectList(projects) {
   $('projectList').innerHTML = projects.map(p =>
-    `<button class="list-group-item list-group-item-action proj-item" data-name="${p.name}">${p.name}</button>`
+    `<button class="list-group-item list-group-item-action proj-item" data-name="${esc(p.name)}">${esc(p.name)}</button>`
   ).join('');
   document.querySelectorAll('.proj-item').forEach(b =>
     b.onclick = () => selectProject(b.dataset.name));
@@ -317,6 +323,9 @@ $('toggleRaw').onclick = async () => {
     const raw = await api('/api/config/raw');
     $('rawProject').value = raw.project_yml;
     $('rawNotify').value = raw.notify_yml || '';
+  } else {
+    // 切回表单：重新拉取配置，避免表单/缓存与磁盘不一致
+    await refreshProjects();
   }
 };
 
@@ -325,7 +334,21 @@ const STATUS_BADGE = { queued: 'bg-secondary', running: 'bg-primary', success: '
 async function loadHistory() {
   try {
     const tasks = await api('/api/tasks');
-    $('historyBody').innerHTML = tasks.map(t => `
+    let curRow = '';
+    try {
+      const cur = await api('/api/tasks/current');
+      if (cur && cur.status && (cur.status === 'running' || cur.status === 'queued')) {
+        curRow = `<tr class="table-active">
+          <td class="small">${esc((cur.submitted_at || '').replace('T', ' ').slice(0, 19))}</td>
+          <td>${esc(cur.command)}</td>
+          <td class="small text-muted">${esc((cur.args || []).slice(4).join(' '))}</td>
+          <td><span class="badge ${STATUS_BADGE[cur.status] || 'bg-secondary'}">${cur.status}</span></td>
+          <td class="small">执行中…</td>
+          <td>—</td>
+        </tr>`;
+      }
+    } catch (e) { /* 无当前任务 */ }
+    $('historyBody').innerHTML = curRow + tasks.map(t => `
       <tr>
         <td class="small">${esc(t.submitted_at.replace('T', ' ').slice(0, 19))}</td>
         <td>${esc(t.command)}</td>

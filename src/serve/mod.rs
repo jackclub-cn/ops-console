@@ -34,7 +34,7 @@ pub async fn run(
     addr: &str,
     token_override: Option<String>,
 ) -> anyhow::Result<()> {
-    let token = auth::resolve_token(config_dir, token_override, |k| std::env::var(k).ok())?;
+    let (token, generated) = auth::resolve_token(config_dir, token_override, |k| std::env::var(k).ok())?;
     let state = AppState {
         config_dir: config_dir.clone(),
         validator: auth::TokenValidator::new(&token),
@@ -66,7 +66,10 @@ pub async fn run(
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("Web UI 已启动: http://{addr}");
-    println!("访问令牌: {token}");
+    // 仅首次自动生成时打印令牌（避免每次启动把既有令牌输出到 stdout/日志）
+    if generated {
+        println!("已生成新的访问令牌: {token}（仅此一次显示，请妥善保存）");
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }

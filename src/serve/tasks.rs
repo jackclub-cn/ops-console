@@ -276,12 +276,22 @@ impl TaskManager {
                 yield Ok(Event::default().event("status").data(format!("{current_id} {st}")));
             }
             let mut rx = rx;
-            while let Ok(msg) = rx.recv().await {
-                let Some((task_id, kind, payload)) = parse_broadcast(&msg) else { continue };
-                if kind == "status" {
-                    yield Ok(Event::default().event("status").data(format!("{task_id} {payload}")));
-                } else {
-                    yield Ok(Event::default().event("line").data(payload));
+            loop {
+                match rx.recv().await {
+                    Ok(msg) => {
+                        let Some((task_id, kind, payload)) = parse_broadcast(&msg) else {
+                            continue;
+                        };
+                        if kind == "status" {
+                            yield Ok(Event::default().event("status").data(format!("{task_id} {payload}")));
+                        } else {
+                            yield Ok(Event::default().event("line").data(payload));
+                        }
+                    }
+                    // 消费者追不上：丢行降级，继续读，不静默断流
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    // 所有发送端已关闭（TaskManager 被销毁）：正常结束
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         };

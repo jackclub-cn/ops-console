@@ -193,7 +193,8 @@ impl ProviderConfig {
 
 /// 原子写文件：先写临时文件再 rename；Unix 下设置 0600。
 pub fn write_atomic(path: &Path, content: &str) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    // 随机后缀：避免并发保存（同进程多 handler）写同一 tmp 文件相互覆盖
+    let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
     std::fs::write(&tmp, content)
         .map_err(|e| anyhow!("写入临时文件失败 {}: {e}", tmp.display()))?;
     #[cfg(unix)]
@@ -222,7 +223,8 @@ pub struct ServeConfig {
 
 impl ServeConfig {
     /// 读取 <dir>/serve.yml；不存在或 token 为空时生成随机 token 并保存。
-    pub fn load_or_create(dir: &Path) -> Result<Self> {
+    /// 返回 (配置, 本次是否新生成 token)。
+    pub fn load_or_create(dir: &Path) -> Result<(Self, bool)> {
         let path = dir.join("serve.yml");
         let mut cfg: ServeConfig = match std::fs::read_to_string(&path) {
             Ok(t) => serde_yaml::from_str(&t)
@@ -232,8 +234,9 @@ impl ServeConfig {
         if cfg.token.is_empty() {
             cfg.token = uuid::Uuid::new_v4().simple().to_string();
             write_atomic(&path, &serde_yaml::to_string(&cfg)?)?;
+            return Ok((cfg, true));
         }
-        Ok(cfg)
+        Ok((cfg, false))
     }
 }
 
@@ -276,9 +279,11 @@ mod tests {
     fn test_serve_config_create_and_reuse() {
         let dir = std::env::temp_dir().join(format!("ops-console-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let first = ServeConfig::load_or_create(&dir).unwrap();
+        let (first, first_generated) = ServeConfig::load_or_create(&dir).unwrap();
         assert!(!first.token.is_empty());
-        let second = ServeConfig::load_or_create(&dir).unwrap();
+        let (second, second_generated) = ServeConfig::load_or_create(&dir).unwrap();
+        assert!(first_generated, "首次调用应生成 token");
+        assert!(!second_generated, "已存在的 serve.yml 不应再生成");
         assert_eq!(first.token, second.token, "已存在的 serve.yml 应复用 token");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -288,7 +293,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ops-console-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("serve.yml"), "token: \"\"\n").unwrap();
-        let cfg = ServeConfig::load_or_create(&dir).unwrap();
+        let cfg = ServeConfig::load_or_create(&dir).unwrap().0;
         assert!(!cfg.token.is_empty());
         let saved: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(dir.join("serve.yml")).unwrap()).unwrap();

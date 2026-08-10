@@ -5,22 +5,23 @@ use anyhow::{anyhow, Result};
 use std::path::Path;
 
 /// 解析最终访问令牌。env_getter 可注入（测试用），默认 std::env::var。
+/// 返回 (令牌, 是否本次新生成)。
 pub fn resolve_token(
     dir: &Path,
     override_token: Option<String>,
     env_getter: impl Fn(&str) -> Option<String>,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     if let Some(t) = override_token.filter(|s| !s.is_empty()) {
-        return Ok(t);
+        return Ok((t, false));
     }
     if let Some(t) = env_getter("OPS_CONSOLE_TOKEN").filter(|s| !s.is_empty()) {
-        return Ok(t);
+        return Ok((t, false));
     }
-    let serve = config::ServeConfig::load_or_create(dir)?;
+    let (serve, generated) = config::ServeConfig::load_or_create(dir)?;
     if serve.token.is_empty() {
         return Err(anyhow!("无法确定访问令牌（serve.yml 为空且无环境变量）"));
     }
-    Ok(serve.token)
+    Ok((serve.token, generated))
 }
 
 /// 校验器：比较请求携带的 token 与预期值（恒定时间比较，避免时序侧信道）。
@@ -65,15 +66,17 @@ mod tests {
         // serve.yml 有 token
         std::fs::write(dir.join("serve.yml"), "token: from-file\n").unwrap();
         // 无 override、无 env → 文件值
-        assert_eq!(resolve_token(&dir, None, |_| None).unwrap(), "from-file");
+        assert_eq!(resolve_token(&dir, None, |_| None).unwrap().0, "from-file");
         // override 优先于 env
         assert_eq!(
-            resolve_token(&dir, Some("from-arg".into()), |_| Some("from-env".into())).unwrap(),
+            resolve_token(&dir, Some("from-arg".into()), |_| Some("from-env".into()))
+                .unwrap()
+                .0,
             "from-arg"
         );
         // 无 override、有 env → env 优先于文件
         assert_eq!(
-            resolve_token(&dir, None, |_| Some("from-env".into())).unwrap(),
+            resolve_token(&dir, None, |_| Some("from-env".into())).unwrap().0,
             "from-env"
         );
         std::fs::remove_dir_all(&dir).ok();

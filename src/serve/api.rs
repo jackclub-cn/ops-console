@@ -153,6 +153,16 @@ pub async fn save_config(State(state): State<AppState>, Json(payload): Json<Conf
         notify.dingtalk.secret = orig_notify.dingtalk.secret.clone();
     }
 
+    // 项目名唯一性校验（表单模式：前端可新增同名项目，保存后会导致目标歧义）
+    {
+        let mut seen = std::collections::HashSet::new();
+        for p in &projects {
+            if !seen.insert(p.name.clone()) {
+                return (StatusCode::BAD_REQUEST, format!("项目名重复: {}", p.name)).into_response();
+            }
+        }
+    }
+
     // 序列化 + 校验
     let project_yaml = match serde_yaml::to_string(&projects) {
         Ok(y) => y,
@@ -193,9 +203,19 @@ pub async fn save_raw(State(state): State<AppState>, Json(payload): Json<RawPayl
     if let Err(e) = Config::from_str(&payload.project_yml, notify_ref) {
         return (StatusCode::BAD_REQUEST, format!("校验失败: {e:#}")).into_response();
     }
-    let r = config::write_atomic(&state.config_dir.join("project.yml"), &payload.project_yml)
-        .and_then(|_| config::write_atomic(&state.config_dir.join("notify.yml"), &notify_text));
-    match r {
+    let notify_path = state.config_dir.join("notify.yml");
+    let write_project = config::write_atomic(&state.config_dir.join("project.yml"), &payload.project_yml);
+    let write_notify = if notify_text.trim().is_empty() {
+        // 空/缺省 notify.yml = 不通知：删除 notify.yml（若存在），不落空文件
+        match std::fs::remove_file(&notify_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("删除 {} 失败: {e}", notify_path.display())),
+        }
+    } else {
+        config::write_atomic(&notify_path, &notify_text)
+    };
+    match write_project.and_then(|_| write_notify) {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("写盘失败: {e:#}")).into_response(),
     }
@@ -267,6 +287,7 @@ mod tests {
             .route("/api/config", axum::routing::get(get_config).post(save_config))
             .route("/api/config/raw", axum::routing::get(get_raw).post(save_raw))
             .route("/api/tasks", axum::routing::get(list_tasks))
+            .route("/api/tasks/current/stream", axum::routing::get(stream_current))
             .with_state(state.clone())
             .route_layer(middleware::from_fn_with_state(state, require_auth))
     }
@@ -324,6 +345,52 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let file = std::fs::read_to_string(st.config_dir.join("project.yml")).unwrap();
         assert!(file.contains("real-secret"), "掩码不应覆盖真实 secret: {file}");
+    }
+
+    #[tokio::test]
+    async fn test_stream_requires_auth() {
+        let st = test_state();
+        let app = app(st.clone());
+        // 无 token → 401
+        let res = app
+            .clone()
+            .oneshot(Request::builder().method("GET").uri("/api/tasks/current/stream").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        // 带 token → 200
+        let ok = app
+            .oneshot(auth_req("GET", "/api/tasks/current/stream", None))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_config_duplicate_project_name_rejected() {
+        let st = test_state();
+        let app = app(st.clone());
+        let body = r#"{"projects":[{"name":"demo","providers":{}},{"name":"demo","providers":{}}],"notify":{}}"#;
+        let res = app.oneshot(auth_req("POST", "/api/config", Some(body))).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "重复项目名应被 400 拒绝");
+    }
+
+    #[tokio::test]
+    async fn test_save_raw_empty_notify_removes_file() {
+        let st = test_state();
+        // 预置 notify.yml 存在
+        assert!(st.config_dir.join("notify.yml").exists());
+        let app = app(st.clone());
+        let body = r#"{"project_yml":"- name: demo\n  providers:\n    aliyun:\n      region: cn-shenzhen\n","notify_yml":""}"#;
+        let res = app.oneshot(auth_req("POST", "/api/config/raw", Some(body))).await.unwrap();
+        let status = res.status();
+        if status != StatusCode::OK {
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            panic!("expected 200 got {status}: {}", String::from_utf8_lossy(&body));
+        }
+        assert!(!st.config_dir.join("notify.yml").exists(), "空 notify_yml 应删除 notify.yml 而非写空文件");
+        // project.yml 仍在
+        assert!(st.config_dir.join("project.yml").exists());
     }
 
     #[tokio::test]
