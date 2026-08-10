@@ -5,7 +5,7 @@ edition = "2021"
 description = "服务商运维系统：多服务商统一运维抽象（快照轮转起步）"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "sync", "io-util", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -18,9 +18,15 @@ hmac = "0.12"
 sha1 = "0.10"
 sha2 = "0.10"
 base64 = "0.22"
+axum = "0.8"
+futures-util = "0.3"
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [profile.release]
 lto = true

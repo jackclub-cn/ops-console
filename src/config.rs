@@ -1,14 +1,14 @@
 //! 配置加载：config/project.yml（项目+服务商）+ config/notify.yml（通知渠道）+ 环境变量覆盖。
 
 use anyhow::{anyhow, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::path::Path;
 
 /// 服务商级配置。字段名即 `kind`（如 `aliyun`），
 /// 新服务商 = 在 provider 配置里加一节 `[project.providers.xxx]`。
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ProviderConfig {
     #[serde(default = "default_region")]
     pub region: String,
@@ -23,7 +23,7 @@ fn default_region() -> String {
     "cn-shenzhen".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Project {
     pub name: String,
     #[serde(default)]
@@ -41,7 +41,7 @@ pub struct Config {
     pub notify: NotifyConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct NotifyConfig {
     /// none | dingtalk（空 = 不通知）
     #[serde(default)]
@@ -54,7 +54,7 @@ pub struct NotifyConfig {
     pub dingtalk: DingTalkConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct DingTalkConfig {
     /// 留空则从环境变量 DINGTALK_WEBHOOK_URL 读取
     #[serde(default)]
@@ -65,33 +65,45 @@ pub struct DingTalkConfig {
 }
 
 impl Config {
-    /// 从配置目录加载：`<dir>/project.yml` + `<dir>/notify.yml`（可选）。
+    /// 从配置目录加载：`<dir>/project.yml` + `<dir>/notify.yml`（可选），随后应用环境变量覆盖。
     pub fn load(dir: &Path) -> Result<Self> {
         let projects_path = dir.join("project.yml");
         let text = std::fs::read_to_string(&projects_path)
             .map_err(|e| anyhow!("读取配置文件失败 {}: {e}", projects_path.display()))?;
+        let notify_text = std::fs::read_to_string(dir.join("notify.yml")).ok();
+        let mut cfg = Self::from_str(&text, notify_text.as_deref())?;
+        cfg.apply_env_overrides();
+        Ok(cfg)
+    }
+
+    /// 纯解析（不读文件、不做环境变量覆盖）。用于配置校验与 Web 保存前验证。
+    pub fn from_str(project_yml: &str, notify_yml: Option<&str>) -> Result<Self> {
         // YAML 文档根可以是数组，直接反序列化为项目列表
-        let mut projects: Vec<Project> = serde_yaml::from_str(&text)
-            .map_err(|e| anyhow!("解析配置文件失败 {}: {e}", projects_path.display()))?;
+        let projects: Vec<Project> = serde_yaml::from_str(project_yml)
+            .map_err(|e| anyhow!("解析项目配置失败: {e}"))?;
         if projects.is_empty() {
-            return Err(anyhow!(
-                "{} 中没有配置任何项目（需要至少一个项目条目）",
-                projects_path.display()
-            ));
+            return Err(anyhow!("没有配置任何项目（需要至少一个项目条目）"));
         }
 
         // notify.yml 可选：不存在 = 不通知
-        let notify_path = dir.join("notify.yml");
-        let mut notify: NotifyConfig = match std::fs::read_to_string(&notify_path) {
-            Ok(t) => serde_yaml::from_str(&t)
-                .map_err(|e| anyhow!("解析配置文件失败 {}: {e}", notify_path.display()))?,
-            Err(_) => NotifyConfig::default(),
+        let mut notify: NotifyConfig = match notify_yml {
+            Some(t) => serde_yaml::from_str(t)
+                .map_err(|e| anyhow!("解析通知配置失败: {e}"))?,
+            None => NotifyConfig::default(),
         };
+        if notify.kind.is_empty() && !notify.dingtalk.webhook.is_empty() {
+            // 配置了 webhook 但没写 kind：视为 dingtalk，降低误配置成本
+            notify.kind = "dingtalk".to_string();
+        }
 
-        // 环境变量覆盖（CI / systemd / cron 场景）
+        Ok(Self { projects, notify })
+    }
+
+    /// 环境变量覆盖（CI / systemd / cron 场景；Web 保存配置时不会调用，避免覆盖文件值）
+    fn apply_env_overrides(&mut self) {
         if let Ok(v) = env::var("ALIYUN_ACCESS_KEY_ID") {
             if !v.is_empty() {
-                for p in &mut projects {
+                for p in &mut self.projects {
                     if let Some(aliyun) = p.providers.get_mut("aliyun") {
                         aliyun.access_key_id = Some(v.clone());
                     }
@@ -100,7 +112,7 @@ impl Config {
         }
         if let Ok(v) = env::var("ALIYUN_ACCESS_KEY_SECRET") {
             if !v.is_empty() {
-                for p in &mut projects {
+                for p in &mut self.projects {
                     if let Some(aliyun) = p.providers.get_mut("aliyun") {
                         aliyun.access_key_secret = Some(v.clone());
                     }
@@ -109,20 +121,14 @@ impl Config {
         }
         if let Ok(v) = env::var("DINGTALK_WEBHOOK_URL") {
             if !v.is_empty() {
-                notify.dingtalk.webhook = v;
+                self.notify.dingtalk.webhook = v;
             }
         }
         if let Ok(v) = env::var("DINGTALK_SECRET") {
             if !v.is_empty() {
-                notify.dingtalk.secret = v;
+                self.notify.dingtalk.secret = v;
             }
         }
-        if notify.kind.is_empty() && !notify.dingtalk.webhook.is_empty() {
-            // 配置了 webhook 但没写 kind：视为 dingtalk，降低误配置成本
-            notify.kind = "dingtalk".to_string();
-        }
-
-        Ok(Self { projects, notify })
     }
 
     /// 取项目下指定 kind 的服务商配置；未配置返回错误。
@@ -178,5 +184,111 @@ impl ProviderConfig {
                 )
             })?;
         Ok((id, secret))
+    }
+}
+
+/// 原子写文件：先写临时文件再 rename；Unix 下设置 0600。
+pub fn write_atomic(path: &Path, content: &str) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content)
+        .map_err(|e| anyhow!("写入临时文件失败 {}: {e}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| anyhow!("设置权限失败 {}: {e}", tmp.display()))?;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Windows rename 不能覆盖已存在文件：先删再试
+            let _ = std::fs::remove_file(path);
+            std::fs::rename(&tmp, path)
+                .map_err(|e2| anyhow!("写文件失败 {}: {e} / {e2}", path.display()))
+        }
+    }
+}
+
+/// serve.yml：Web UI 访问令牌配置。token 为空时自动生成并写回。
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ServeConfig {
+    #[serde(default)]
+    pub token: String,
+}
+
+impl ServeConfig {
+    /// 读取 <dir>/serve.yml；不存在或 token 为空时生成随机 token 并保存。
+    pub fn load_or_create(dir: &Path) -> Result<Self> {
+        let path = dir.join("serve.yml");
+        let mut cfg: ServeConfig = match std::fs::read_to_string(&path) {
+            Ok(t) => serde_yaml::from_str(&t)
+                .map_err(|e| anyhow!("解析 {} 失败: {e}", path.display()))?,
+            Err(_) => ServeConfig::default(),
+        };
+        if cfg.token.is_empty() {
+            cfg.token = uuid::Uuid::new_v4().simple().to_string();
+            write_atomic(&path, &serde_yaml::to_string(&cfg)?)?;
+        }
+        Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_from_str_ok() {
+        let cfg = Config::from_str(
+            "- name: demo\n  providers:\n    aliyun:\n      region: cn-shenzhen\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.projects.len(), 1);
+        assert_eq!(cfg.projects[0].name, "demo");
+    }
+
+    #[test]
+    fn test_from_str_empty_rejected() {
+        let err = Config::from_str("# 空文件\n", None).unwrap_err();
+        assert!(err.to_string().contains("至少一个项目"));
+    }
+
+    #[test]
+    fn test_from_str_bad_yaml_rejected() {
+        assert!(Config::from_str(":: not yaml ::", None).is_err());
+    }
+
+    #[test]
+    fn test_project_yaml_roundtrip() {
+        let src = "- name: demo\n  description: 示例\n  providers:\n    aliyun:\n      region: cn-shenzhen\n      access_key_id: AKID\n";
+        let cfg = Config::from_str(src, None).unwrap();
+        let yaml = serde_yaml::to_string(&cfg.projects).unwrap();
+        let back = Config::from_str(&yaml, None).unwrap();
+        assert_eq!(back.projects[0].providers["aliyun"].access_key_id.as_deref(), Some("AKID"));
+    }
+
+    #[test]
+    fn test_serve_config_create_and_reuse() {
+        let dir = std::env::temp_dir().join(format!("ops-console-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = ServeConfig::load_or_create(&dir).unwrap();
+        assert!(!first.token.is_empty());
+        let second = ServeConfig::load_or_create(&dir).unwrap();
+        assert_eq!(first.token, second.token, "已存在的 serve.yml 应复用 token");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_serve_config_empty_token_regenerated() {
+        let dir = std::env::temp_dir().join(format!("ops-console-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("serve.yml"), "token: \"\"\n").unwrap();
+        let cfg = ServeConfig::load_or_create(&dir).unwrap();
+        assert!(!cfg.token.is_empty());
+        let saved: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(dir.join("serve.yml")).unwrap()).unwrap();
+        assert_eq!(saved["token"].as_str().unwrap(), cfg.token);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
