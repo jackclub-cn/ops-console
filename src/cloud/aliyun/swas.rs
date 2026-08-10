@@ -57,6 +57,9 @@ pub struct SwasDisk {
     pub disk_type: String,
     #[serde(rename = "DiskName", default)]
     pub disk_name: String,
+    /// 磁盘容量（GB）
+    #[serde(rename = "Size", default)]
+    pub size: i32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +90,13 @@ pub struct SwasSnapshot {
 pub struct CreateSnapshotResponse {
     #[serde(rename = "SnapshotId")]
     pub snapshot_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DescribeMonitorDataResponse {
+    /// Datapoints 是 JSON 编码的字符串数组（元素含 timestamp 与数值字段）
+    #[serde(rename = "Datapoints", default)]
+    pub datapoints: String,
 }
 
 // ---------- 客户端 ----------
@@ -157,5 +167,90 @@ impl SwasClient {
                 .call("DeleteSnapshot", SWAS_API_VERSION, &[("SnapshotId", snapshot_id)])
                 .await?;
         Ok(())
+    }
+
+    /// 查询实例磁盘已用空间（bytes）。
+    /// 近 10 分钟窗口内无监控数据（如未装云监控插件）返回 None。
+    pub async fn disk_usage_used(&self, instance_id: &str) -> Result<Option<u64>> {
+        let now = chrono::Utc::now();
+        let start = now - chrono::Duration::minutes(10);
+        let start_s = start.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let end_s = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let resp: DescribeMonitorDataResponse = self
+            .rpc
+            .call(
+                "DescribeMonitorData",
+                SWAS_API_VERSION,
+                &[
+                    ("InstanceId", instance_id),
+                    ("MetricName", "DISKUSAGE_USED"),
+                    ("Period", "300"),
+                    ("StartTime", start_s.as_str()),
+                    ("EndTime", end_s.as_str()),
+                ],
+            )
+            .await?;
+        Ok(parse_latest_usage(&resp.datapoints))
+    }
+}
+
+/// 解析 DescribeMonitorData 的 Datapoints（JSON 数组字符串），返回时间戳最新点的数值（bytes）。
+/// 元素数值字段兼容 `Value`/`value`/`Average`；时间戳兼容 `timestamp`/`Timestamp`（缺省按 0）。
+/// 空/非法/无数值字段 → None。
+fn parse_latest_usage(datapoints: &str) -> Option<u64> {
+    let arr: Vec<serde_json::Value> = serde_json::from_str(datapoints).ok()?;
+    let mut best: Option<(i64, u64)> = None;
+    for p in arr {
+        let ts = p
+            .get("timestamp")
+            .or_else(|| p.get("Timestamp"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let val = p
+            .get("Value")
+            .or_else(|| p.get("value"))
+            .or_else(|| p.get("Average"))
+            .and_then(|v| v.as_f64())
+            .map(|f| f as u64);
+        if let Some(v) = val {
+            if best.map_or(true, |(bt, _)| ts > bt) {
+                best = Some((ts, v));
+            }
+        }
+    }
+    best.map(|(_, v)| v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_disk_size_field() {
+        let j = r#"{"DiskId":"d-xxx","DiskType":"System","DiskName":"系统盘","Size":50}"#;
+        let d: SwasDisk = serde_json::from_str(j).unwrap();
+        assert_eq!(d.size, 50);
+    }
+
+    #[test]
+    fn test_parse_latest_usage() {
+        // 取时间戳最新的点
+        let s = r#"[{"timestamp": 1699219200, "Value": 1000}, {"timestamp": 1699219500, "Value": 2000}]"#;
+        assert_eq!(parse_latest_usage(s), Some(2000));
+
+        // 小写 value 兼容；缺 timestamp 按 0 处理
+        let s = r#"[{"timestamp": 1699219500, "value": 3000}]"#;
+        assert_eq!(parse_latest_usage(s), Some(3000));
+
+        // Average 兜底（字段名变体）
+        let s = r#"[{"timestamp": 1, "Average": 4096.0}]"#;
+        assert_eq!(parse_latest_usage(s), Some(4096));
+
+        // 空数组 / 空串 / 非 JSON / 无数值字段 → None
+        assert_eq!(parse_latest_usage("[]"), None);
+        assert_eq!(parse_latest_usage(""), None);
+        assert_eq!(parse_latest_usage("not json"), None);
+        let s = r#"[{"timestamp": 1}]"#;
+        assert_eq!(parse_latest_usage(s), None);
     }
 }
