@@ -105,14 +105,22 @@ pub fn render_disk(
         out.push_str("=== 磁盘占用检查 ===\n");
         for (project, kind, s) in over {
             let pct = s.utilization.unwrap_or(0.0);
+            // ECS 路径无字节信息（total=0），只输出 detail，避免误导性 "已用 0 B"
+            let detail = if s.total_bytes > 0 {
+                format!(
+                    "已用 {}/{} {}",
+                    format_bytes(s.used_bytes),
+                    format_bytes(s.total_bytes),
+                    s.detail
+                )
+            } else {
+                s.detail.clone()
+            };
             out.push_str(&format!(
-                "- {project}/{kind}: {} ({}) {:.1}% (已用 {}/{} {})\n",
+                "- {project}/{kind}: {} ({}) {:.1}% ({detail})\n",
                 s.server.name,
                 s.server.id,
                 pct,
-                format_bytes(s.used_bytes),
-                format_bytes(s.total_bytes),
-                s.detail
             ));
         }
     }
@@ -177,7 +185,13 @@ async fn disk_usage_swas(client: &SwasClient, instance_id: &str) -> Result<Optio
         return Ok(None);
     }
     let total = disk.size as u64 * 1024 * 1024 * 1024;
-    Ok(Some((used, total, "系统盘".to_string())))
+    // 按实际选中的磁盘类型标注（回退到非 System 盘时不误标为系统盘）
+    let detail = match disk.disk_type.as_str() {
+        "System" => "系统盘".to_string(),
+        "Data" => "数据盘".to_string(),
+        other => format!("磁盘({other})"),
+    };
+    Ok(Some((used, total, detail)))
 }
 
 /// SWAS 磁盘检查：只查 Running 实例；返回 (超阈值列表, 数据缺失列表)。
@@ -359,6 +373,16 @@ mod tests {
         assert!(text.contains("web (i-web) 91.2% (已用 45.0 GB/50.0 GB 系统盘)"));
         assert!(text.contains("=== 数据缺失 ==="));
         assert!(text.contains("cache (i-cache) 无磁盘监控数据（疑似未装云监控插件）"));
+
+        // ECS 风格：total_bytes=0（无字节信息）→ 只输出 detail，不输出误导性 "已用 0 B"
+        let over_ecs = vec![(
+            "prod".to_string(),
+            "aliyun-ecs".to_string(),
+            mk_status("db", Some(95.0), 0, 0, "设备: /dev/vda1 95.0%"),
+        )];
+        let text_ecs = render_disk(&over_ecs, &[]);
+        assert!(text_ecs.contains("db (i-db) 95.0% (设备: /dev/vda1 95.0%)"));
+        assert!(!text_ecs.contains("已用 0 B"));
 
         // 全空 → 空字符串
         assert_eq!(render_disk(&[], &[]), "");

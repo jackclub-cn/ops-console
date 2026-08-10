@@ -246,6 +246,10 @@ mod tests {
         let s = r#"[{"timestamp": 1, "Average": 4096.0}]"#;
         assert_eq!(parse_latest_usage(s), Some(4096));
 
+        // 大写 Timestamp 兼容
+        let s = r#"[{"Timestamp": 1699219500, "Value": 500}]"#;
+        assert_eq!(parse_latest_usage(s), Some(500));
+
         // 空数组 / 空串 / 非 JSON / 无数值字段 → None
         assert_eq!(parse_latest_usage("[]"), None);
         assert_eq!(parse_latest_usage(""), None);

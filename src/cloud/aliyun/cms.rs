@@ -132,5 +132,13 @@ mod tests {
         assert!(parse_points(r#"[{"instanceId":"i-1"}]"#).is_empty());
         // 数值键存在但非数值（如字符串 "91.2%"）→ as_f64 为 None → 跳过
         assert!(parse_points(r#"[{"instanceId":"i-1","Average":"91.2%"}]"#).is_empty());
+
+        // 大写 InstanceId/Device 兼容
+        let s = r#"[{"InstanceId":"i-1","Device":"/dev/vda1","Average":88.8}]"#;
+        let pts = parse_points(s);
+        assert_eq!(pts.len(), 1);
+        assert_eq!(pts[0].instance_id, "i-1");
+        assert_eq!(pts[0].device, "/dev/vda1");
+        assert_eq!(pts[0].average, 88.8);
     }
 }
