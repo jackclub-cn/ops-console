@@ -117,9 +117,10 @@ pub fn render_disk(
                 s.detail.clone()
             };
             out.push_str(&format!(
-                "- {project}/{kind}: {} ({}) {:.1}% ({detail})\n",
+                "- {project}/{kind}: {} ({}{}) {:.1}% ({detail})\n",
                 s.server.name,
                 s.server.id,
+                crate::cloud::region_suffix(&s.server.region),
                 pct,
             ));
         }
@@ -131,8 +132,10 @@ pub fn render_disk(
         out.push_str("=== 数据缺失 ===\n");
         for (project, kind, s) in missing {
             out.push_str(&format!(
-                "- {project}/{kind}: {} ({}) 无磁盘监控数据（疑似未装云监控插件）\n",
-                s.server.name, s.server.id
+                "- {project}/{kind}: {} ({}{}) 无磁盘监控数据（疑似未装云监控插件）\n",
+                s.server.name,
+                s.server.id,
+                crate::cloud::region_suffix(&s.server.region)
             ));
         }
     }
@@ -157,12 +160,12 @@ pub fn title(over: &[(String, String, DiskStatus)], missing: &[(String, String, 
 
 // ---------- 网络面 check 函数 ----------
 
-/// 构建展示用 Server（region 留空：render 不使用）
-fn server_from(name: String, id: String, status: &str) -> Server {
+/// 构建展示用 Server
+fn server_from(name: String, id: String, status: &str, region: &str) -> Server {
     Server {
         id,
         name,
-        region: String::new(),
+        region: region.to_string(),
         status: status.to_string(),
         expired_at: None,
     }
@@ -202,6 +205,7 @@ async fn disk_usage_swas(client: &SwasClient, instance_id: &str) -> Result<Optio
 /// 单实例查询失败 → println 告警并跳过（不归入缺失，避免把 API 错误误报成插件问题）。
 pub async fn check_swas_disk(
     client: &SwasClient,
+    region: &str,
     threshold: f64,
 ) -> Result<(Vec<DiskStatus>, Vec<DiskStatus>)> {
     let instances = client.list_instances().await?;
@@ -222,7 +226,7 @@ pub async fn check_swas_disk(
             Ok(Some((used, total_bytes, detail))) => {
                 let utilization = used as f64 / total_bytes as f64 * 100.0;
                 let status = DiskStatus {
-                    server: server_from(name.clone(), id.clone(), &inst.status),
+                    server: server_from(name.clone(), id.clone(), &inst.status, region),
                     utilization: Some(utilization),
                     used_bytes: used,
                     total_bytes,
@@ -233,7 +237,7 @@ pub async fn check_swas_disk(
                 }
             }
             Ok(None) => missing.push(DiskStatus {
-                server: server_from(name.clone(), id.clone(), &inst.status),
+                server: server_from(name.clone(), id.clone(), &inst.status, region),
                 utilization: None,
                 used_bytes: 0,
                 total_bytes: 0,
@@ -383,9 +387,9 @@ mod tests {
             mk_status("cache", None, 0, 0, ""),
         )];
         let text = render_disk(&over, &missing);
-        assert!(text.contains("web (i-web) 91.2% (已用 45.0 GB/50.0 GB 系统盘)"));
+        assert!(text.contains("web (i-web, cn-shenzhen) 91.2% (已用 45.0 GB/50.0 GB 系统盘)"));
         assert!(text.contains("=== 数据缺失 ==="));
-        assert!(text.contains("cache (i-cache) 无磁盘监控数据（疑似未装云监控插件）"));
+        assert!(text.contains("cache (i-cache, cn-shenzhen) 无磁盘监控数据（疑似未装云监控插件）"));
 
         // ECS 风格：total_bytes=0（无字节信息）→ 只输出 detail，不输出误导性 "已用 0 B"
         let over_ecs = vec![(
@@ -394,7 +398,7 @@ mod tests {
             mk_status("db", Some(95.0), 0, 0, "设备: /dev/vda1 95.0%"),
         )];
         let text_ecs = render_disk(&over_ecs, &[]);
-        assert!(text_ecs.contains("db (i-db) 95.0% (设备: /dev/vda1 95.0%)"));
+        assert!(text_ecs.contains("db (i-db, cn-shenzhen) 95.0% (设备: /dev/vda1 95.0%)"));
         assert!(!text_ecs.contains("已用 0 B"));
 
         // 全空 → 空字符串

@@ -157,6 +157,27 @@ impl EcsClient {
         }
     }
 
+    /// 查询全部地域（全局接口，与调用地域无关；用于 region=global 自动发现）
+    pub async fn describe_regions(&self) -> Result<Vec<String>> {
+        #[derive(Deserialize, Default)]
+        struct RegionList {
+            #[serde(rename = "Region", default)]
+            items: Vec<EcsRegion>,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(rename = "Regions", default)]
+            regions: RegionList,
+        }
+        #[derive(Deserialize)]
+        struct EcsRegion {
+            #[serde(rename = "RegionId")]
+            region_id: String,
+        }
+        let resp: Resp = self.rpc.call("DescribeRegions", ECS_API_VERSION, &[]).await?;
+        Ok(resp.regions.items.into_iter().map(|r| r.region_id).collect())
+    }
+
     pub async fn list_instances(&self) -> Result<Vec<EcsInstance>> {
         #[derive(Deserialize, Default)]
         struct InstanceList {

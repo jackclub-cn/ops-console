@@ -177,7 +177,11 @@ pub async fn save_config(State(state): State<AppState>, Json(payload): Json<Conf
     match config::write_atomic(&state.config_dir.join("project.yml"), &project_yaml)
         .and_then(|_| config::write_atomic(&state.config_dir.join("notify.yml"), &notify_yaml))
     {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(()) => {
+            // 配置变更：后台刷新资源快照（不阻塞保存响应）
+            spawn_resource_refresh(&state);
+            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("写盘失败: {e:#}")).into_response(),
     }
 }
@@ -216,7 +220,11 @@ pub async fn save_raw(State(state): State<AppState>, Json(payload): Json<RawPayl
         config::write_atomic(&notify_path, &notify_text)
     };
     match write_project.and_then(|_| write_notify) {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(()) => {
+            // 配置变更：后台刷新资源快照（不阻塞保存响应）
+            spawn_resource_refresh(&state);
+            (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("写盘失败: {e:#}")).into_response(),
     }
 }
@@ -249,6 +257,323 @@ pub async fn task_output(State(state): State<AppState>, axum::extract::Path(id):
     }
 }
 
+// ---------- 项目资源列表（快照模式） ----------
+//
+// 资源列表不实时查询阿里云，而是维护一份内存快照：
+//   - serve 启动时后台预取一次
+//   - 配置保存（save_config / save_raw）成功后后台刷新
+//   - 前端可手动 POST /api/resources/refresh 立即刷新（阻塞至完成）
+// GET /api/resources 只读快照：ready=false 表示尚未就绪（后台加载中/失败）。
+
+/// 资源条目（SWAS / ECS / 域名统一结构；auto_renew 仅域名使用）
+#[derive(serde::Serialize)]
+pub struct ResourceItem {
+    pub id: String,
+    pub name: String,
+    pub region: String,
+    pub status: String,
+    /// 到期时间（RFC3339 UTC）；无到期为 null
+    pub expired_at: Option<String>,
+    /// 剩余天数（向上取整，<=0 已过期）；无到期为 null
+    pub days_left: Option<i64>,
+    pub auto_renew: bool,
+}
+
+#[derive(serde::Serialize)]
+pub struct ResourceGroup {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub items: Vec<ResourceItem>,
+}
+
+/// 资源快照缓存（AppState 共享）：启动预取 / 配置变更刷新 / 手动刷新共用。
+#[derive(Clone, Default)]
+pub struct ResourceCache {
+    inner: std::sync::Arc<std::sync::Mutex<ResourceSnapshot>>,
+}
+
+#[derive(Default)]
+struct ResourceSnapshot {
+    ready: bool,
+    loading: bool,
+    error: Option<String>,
+    projects: serde_json::Value,
+}
+
+impl ResourceCache {
+    /// 开始后台加载（置 loading=true，GET 期间返回"后台加载中"）。
+    pub fn mark_loading(&self) {
+        let mut s = self.inner.lock().unwrap();
+        s.loading = true;
+        s.error = None;
+    }
+
+    /// 快照就绪：projects 为 `[{name, swas, ecs, domains}, ...]` 数组。
+    pub fn set(&self, projects: serde_json::Value) {
+        let mut s = self.inner.lock().unwrap();
+        s.ready = true;
+        s.loading = false;
+        s.error = None;
+        s.projects = projects;
+    }
+
+    pub fn set_error(&self, error: String) {
+        let mut s = self.inner.lock().unwrap();
+        s.ready = false;
+        s.loading = false;
+        s.error = Some(error);
+    }
+
+    /// (ready, loading, error, projects)
+    pub fn snapshot(&self) -> (bool, bool, Option<String>, serde_json::Value) {
+        let s = self.inner.lock().unwrap();
+        (s.ready, s.loading, s.error.clone(), s.projects.clone())
+    }
+}
+
+fn resource_item(server: crate::cloud::Server) -> ResourceItem {
+    let days_left = server
+        .expired_at
+        .map(|t| crate::ops::expiry::days_left(t, chrono::Utc::now()));
+    ResourceItem {
+        id: server.id,
+        name: server.name,
+        region: server.region,
+        status: server.status,
+        expired_at: server.expired_at.map(|t| t.to_rfc3339()),
+        days_left,
+        auto_renew: false,
+    }
+}
+
+fn resource_error(msg: String) -> ResourceGroup {
+    ResourceGroup {
+        ok: false,
+        error: Some(msg),
+        items: Vec::new(),
+    }
+}
+
+/// 查询单个 aliyun 项目的资源：SWAS 实例、ECS 实例、域名（全局服务）。
+/// 复用一次 provider 构造（global 模式的地域发现只做一遍）；
+/// 每类独立容错：某类失败（权限/网络）只在该组标记 error，不影响其余。
+/// 查询单个项目的 SWAS 实例（global 模式下 provider 内部已跨地域汇总并容忍权限/未开通地域）。
+async fn collect_swas(ak: &str, sk: &str, region: &str) -> ResourceGroup {
+    use crate::cloud::aliyun::AliyunProvider;
+    use crate::cloud::CloudProvider;
+
+    match AliyunProvider::new(ak, sk, region).await {
+        Ok(p) => match p.list_servers().await {
+            Ok(servers) => ResourceGroup {
+                ok: true,
+                error: None,
+                items: servers.into_iter().map(resource_item).collect(),
+            },
+            Err(e) => resource_error(format!("{e:#}")),
+        },
+        Err(e) => resource_error(format!("{e:#}")),
+    }
+}
+
+/// 查询单个项目的 ECS 实例：跨地域遍历（权限类错误跳过；非权限错误记录地域）。
+async fn collect_ecs(ak: &str, sk: &str, region: &str) -> ResourceGroup {
+    use crate::cloud::aliyun::{is_permission_error, AliyunProvider};
+
+    match AliyunProvider::new(ak, sk, region).await {
+        Ok(p) => {
+            let mut items = Vec::new();
+            let mut errs: Vec<String> = Vec::new();
+            let mut no_perm = 0;
+            for g in p.groups() {
+                match g.ecs.list_servers().await {
+                    Ok(s) => items.extend(s.into_iter().map(resource_item)),
+                    Err(e) if is_permission_error(&e) => no_perm += 1,
+                    Err(e) => errs.push(format!("{}: {e:#}", g.region)),
+                }
+            }
+            let error = if !errs.is_empty() {
+                Some(format!("部分地域查询失败: {}", errs.join("; ")))
+            } else if items.is_empty() && no_perm > 0 {
+                Some(format!("{} 个地域无 ECS 权限（可能未购买/未授权）", no_perm))
+            } else {
+                None
+            };
+            ResourceGroup {
+                ok: true,
+                error,
+                items,
+            }
+        }
+        Err(e) => resource_error(format!("{e:#}")),
+    }
+}
+
+/// 查询单个项目的域名（账号级全局服务）；权限类错误视为"未注册域名"跳过（不标失败）。
+async fn collect_domains(ak: &str, sk: &str) -> ResourceGroup {
+    use crate::cloud::aliyun::is_permission_error;
+
+    match crate::cloud::aliyun::domain::DomainClient::new(ak, sk)
+        .list_domains()
+        .await
+    {
+        Ok(ds) => ResourceGroup {
+            ok: true,
+            error: None,
+            items: ds
+                .into_iter()
+                .map(|d| {
+                    let days_left = d
+                        .expired_at
+                        .map(|t| crate::ops::expiry::days_left(t, chrono::Utc::now()));
+                    ResourceItem {
+                        id: d.domain_name.clone(),
+                        name: d.domain_name,
+                        region: "全局".to_string(),
+                        status: String::new(),
+                        expired_at: d.expired_at.map(|t| t.to_rfc3339()),
+                        days_left,
+                        auto_renew: d.auto_renew,
+                    }
+                })
+                .collect(),
+        },
+        Err(e) if is_permission_error(&e) => ResourceGroup {
+            ok: true,
+            error: Some("无 domain 权限（可能未注册域名）".to_string()),
+            items: Vec::new(),
+        },
+        Err(e) => resource_error(format!("{e:#}")),
+    }
+}
+
+/// 收集全部配置了 aliyun（且有凭据）项目的资源，返回 `projects` 数组（JSON）。
+/// 任务粒度 = 项目 × 资源类（SWAS / ECS / 域名），全局并发上限 [`RESOURCE_CONCURRENCY`]。
+/// 供启动预取 / 配置变更刷新 / 手动刷新共用。
+pub async fn gather_resources(config_dir: &Path) -> anyhow::Result<serde_json::Value> {
+    use std::collections::BTreeMap;
+    use tokio::sync::Semaphore;
+
+    const RESOURCE_CONCURRENCY: usize = 4;
+
+    let (projects, _) = read_config_files(config_dir)?;
+
+    // 收集任务列表（未配置凭据的项目跳过）
+    #[derive(Clone)]
+    struct Task {
+        project: String,
+        description: String,
+        kind: &'static str,
+        ak: String,
+        sk: String,
+        region: String,
+    }
+    let mut tasks = Vec::new();
+    for p in &projects {
+        let Some(pcfg) = p.providers.get("aliyun") else { continue };
+        let Ok((ak, sk)) = pcfg.aliyun_credentials() else { continue };
+        let region = pcfg.region.clone();
+        let description = p.description.clone().unwrap_or_default();
+        for kind in ["swas", "ecs", "domains"] {
+            tasks.push(Task {
+                project: p.name.clone(),
+                description: description.clone(),
+                kind,
+                ak: ak.clone(),
+                sk: sk.clone(),
+                region: region.clone(),
+            });
+        }
+    }
+
+    // 并发执行（信号量限流），按项目 × 类型聚合
+    let sem = std::sync::Arc::new(Semaphore::new(RESOURCE_CONCURRENCY));
+    let mut handles = Vec::new();
+    for t in tasks {
+        let sem = sem.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.expect("资源信号量");
+            let group = match t.kind {
+                "swas" => collect_swas(&t.ak, &t.sk, &t.region).await,
+                "ecs" => collect_ecs(&t.ak, &t.sk, &t.region).await,
+                _ => collect_domains(&t.ak, &t.sk).await,
+            };
+            (t.project, t.description, t.kind, group)
+        }));
+    }
+
+    let mut map: BTreeMap<String, serde_json::Map<String, serde_json::Value>> = BTreeMap::new();
+    for h in handles {
+        let (project, description, kind, group) =
+            h.await.map_err(|e| anyhow::anyhow!("资源收集任务异常: {e}"))?;
+        let entry = map.entry(project.clone()).or_default();
+        entry.insert("name".to_string(), serde_json::json!(project));
+        entry.insert("description".to_string(), serde_json::json!(description));
+        // 结构：{ name, providers: { <provider_kind>: { <resource_kind>: group } } }
+        // provider_kind 目前仅 aliyun（未来 tencent/aws 等在任务构建处扩展）
+        let providers = entry
+            .entry("providers".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        let prov = providers
+            .as_object_mut()
+            .expect("providers 应为对象")
+            .entry("aliyun".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        prov.as_object_mut()
+            .expect("provider 应为对象")
+            .insert(kind.to_string(), serde_json::to_value(group)?);
+    }
+    let projects: Vec<serde_json::Value> =
+        map.into_values().map(serde_json::Value::Object).collect();
+    Ok(serde_json::json!({ "projects": projects }))
+}
+
+
+/// GET /api/providers：当前接入的服务商 kind 列表（配置页添加服务商下拉来源）。
+pub async fn providers() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "providers": crate::cloud::SUPPORTED_PROVIDERS }))
+}
+
+/// GET /api/resources：读内存快照（不查询阿里云）。
+/// 返回 `{ ready, loading, error, projects }`；ready=false 时 projects 为空数组。
+pub async fn list_resources(State(state): State<AppState>) -> Response {
+    let (ready, loading, error, projects) = state.resources.snapshot();
+    Json(serde_json::json!({
+        "ready": ready,
+        "loading": loading,
+        "error": error,
+        "projects": if ready { projects } else { serde_json::json!([]) },
+    }))
+    .into_response()
+}
+
+/// POST /api/resources/refresh：立即重新拉取全部项目资源（阻塞至完成），并更新快照。
+pub async fn refresh_resources(State(state): State<AppState>) -> Response {
+    match gather_resources(&state.config_dir).await {
+        Ok(v) => {
+            let projects = v["projects"].clone();
+            state.resources.set(projects);
+            (StatusCode::OK, Json(v)).into_response()
+        }
+        Err(e) => {
+            state.resources.set_error(format!("{e:#}"));
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+/// 配置保存成功后触发后台刷新资源快照（不阻塞保存响应）。
+fn spawn_resource_refresh(state: &AppState) {
+    state.resources.mark_loading();
+    let resources = state.resources.clone();
+    let config_dir = state.config_dir.clone();
+    tokio::spawn(async move {
+        match gather_resources(&config_dir).await {
+            Ok(v) => resources.set(v["projects"].clone()),
+            Err(e) => resources.set_error(format!("{e:#}")),
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +583,7 @@ mod tests {
     use axum::middleware;
     use axum::Router;
     use http_body_util::BodyExt;
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     fn test_state() -> AppState {
@@ -278,6 +604,7 @@ mod tests {
             config_dir: dir,
             validator: auth::TokenValidator::new("tok"),
             tasks,
+            resources: Arc::new(ResourceCache::default()),
         }
     }
 
@@ -287,6 +614,7 @@ mod tests {
             .route("/api/config", axum::routing::get(get_config).post(save_config))
             .route("/api/config/raw", axum::routing::get(get_raw).post(save_raw))
             .route("/api/tasks", axum::routing::get(list_tasks))
+            .route("/api/providers", axum::routing::get(providers))
             .route("/api/tasks/current/stream", axum::routing::get(stream_current))
             .with_state(state.clone())
             .route_layer(middleware::from_fn_with_state(state, require_auth))

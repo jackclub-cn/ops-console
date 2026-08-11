@@ -10,3 +10,4 @@ rotate-and-notify.sh
 # 子代理运行时产物
 .pi-subagents/
 config/serve.yml
+.superpowers/config/ops-console-tasks.jsonl

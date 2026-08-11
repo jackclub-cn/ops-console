@@ -19,8 +19,11 @@ pub struct ProviderConfig {
     pub access_key_secret: Option<String>,
 }
 
+/// region 特殊值：自动发现账号下全部地域（SWAS ListRegions ∪ ECS DescribeRegions）
+pub const REGION_GLOBAL: &str = "global";
+
 fn default_region() -> String {
-    "cn-shenzhen".to_string()
+    REGION_GLOBAL.to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -253,6 +256,17 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.projects.len(), 1);
         assert_eq!(cfg.projects[0].name, "demo");
+    }
+
+    #[test]
+    fn test_region_default_global() {
+        // region 不填 → 默认为 global（自动发现全部地域）
+        let cfg = Config::from_str(
+            "- name: demo\n  providers:\n    aliyun:\n      access_key_id: AKID\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(cfg.projects[0].providers["aliyun"].region, "global");
     }
 
     #[test]

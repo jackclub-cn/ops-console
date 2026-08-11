@@ -12,7 +12,7 @@ async function api(path, opts = {}) {
 }
 
 // ---- 路由 ----
-const pages = ['run', 'config', 'history'];
+const pages = ['run', 'resources', 'config', 'history'];
 function route() {
   const h = location.hash.replace('#/', '');
   const page = pages.includes(h) ? h : 'run';
@@ -20,6 +20,7 @@ function route() {
   $('page-' + page).classList.remove('hidden');
   document.querySelectorAll('[data-nav]').forEach(a =>
     a.classList.toggle('active', a.dataset.nav === page));
+  if (page === 'resources') loadResources();
   if (page === 'config' && !cfgLoaded) loadConfig();
   if (page === 'history') loadHistory();
   if (page === 'run') refreshProjects();
@@ -162,6 +163,143 @@ async function runTask() {
 $('runBtn').onclick = runTask;
 $('clearOutBtn').onclick = () => $('output').innerHTML = '';
 
+// ---- 资源列表页（左侧项目列表 + 右侧 provider Tab）----
+let resProjects = [];        // 资源快照（/api/resources 的 projects）
+let currentResProject = null; // 当前选中项目
+
+async function loadResources() {
+  loadSnapshot();
+}
+
+// 读内存快照（不查询阿里云，秒回）
+async function loadSnapshot() {
+  try {
+    const data = await api('/api/resources');
+    if (data.ready) {
+      resProjects = data.projects || [];
+      if (!currentResProject || !resProjects.find(p => p.name === currentResProject)) {
+        currentResProject = resProjects.length ? resProjects[0].name : null;
+      }
+      renderResList();
+      renderResDetail();
+      return;
+    }
+    $('resProjectList').innerHTML = '<div class="text-muted small p-2">暂无数据</div>';
+    if (data.loading) {
+      $('resBody').innerHTML = '<div class="text-muted py-3">后台加载中（启动/配置变更后自动拉取，global 巡检需几秒）…</div>';
+    } else {
+      $('resBody').innerHTML = '<div class="alert alert-warning py-2">资源尚未加载' +
+        (data.error ? `：${esc(data.error)}` : '') + '，点右上角“刷新”立即加载</div>';
+    }
+  } catch (e) {
+    $('resBody').innerHTML = `<div class="alert alert-danger py-2">加载失败: ${esc(e.message)}</div>`;
+  }
+}
+
+// 手动刷新：阻塞拉取阿里云并更新快照
+async function refreshResources() {
+  $('resBody').innerHTML = '<div class="text-muted py-3">正在刷新…（global 巡检需要几秒）</div>';
+  try {
+    const data = await api('/api/resources/refresh', { method: 'POST' });
+    resProjects = data.projects || [];
+    if (!currentResProject || !resProjects.find(p => p.name === currentResProject)) {
+      currentResProject = resProjects.length ? resProjects[0].name : null;
+    }
+    renderResList();
+    renderResDetail();
+  } catch (e) {
+    $('resBody').innerHTML = `<div class="alert alert-danger py-2">刷新失败: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderResList() {
+  const items = resProjects.map(p => {
+    const n = Object.keys(p.providers || {}).length;
+    const badge = n ? `<span class="badge bg-secondary">${n} provider</span>` : '';
+    // name 为主、描述为辅；无描述时直接用 name
+    const label = p.description && p.description !== p.name
+      ? `${p.name}（${p.description}）`
+      : p.name;
+    return `<button class="list-group-item list-group-item-action d-flex justify-content-between align-items-center res-proj ${p.name === currentResProject ? 'active' : ''}" data-name="${esc(p.name)}">${esc(label)}${badge}</button>`;
+  }).join('');
+  $('resProjectList').innerHTML = items || '<div class="text-muted small p-2">没有配置 aliyun 服务商（且填了凭据）的项目</div>';
+  document.querySelectorAll('#resProjectList .res-proj').forEach(b =>
+    b.onclick = () => { currentResProject = b.dataset.name; renderResList(); renderResDetail(); });
+}
+
+function renderResDetail() {
+  const p = resProjects.find(x => x.name === currentResProject);
+  if (!p) { $('resBody').innerHTML = '<div class="text-muted py-3">选择左侧项目</div>'; return; }
+  const providers = p.providers || {};
+  const kinds = Object.keys(providers);
+  if (!kinds.length) {
+    $('resBody').innerHTML = `<div class="card shadow-sm"><div class="card-body text-muted">项目 ${esc(p.name)} 未配置服务商（或未填凭据）</div></div>`;
+    return;
+  }
+  // provider Tab（目前仅 aliyun，未来扩展 tencent/aws 自动出现）
+  const tabs = kinds.map((k, i) =>
+    `<button class="nav-link ${i === 0 ? 'active' : ''}" data-bs-toggle="tab" data-bs-target="#res-pane-${i}" type="button">${esc(k)}</button>`).join('');
+  const panes = kinds.map((k, i) => `
+    <div class="tab-pane fade ${i === 0 ? 'show active' : ''}" id="res-pane-${i}">
+      ${renderGroup('SWAS 实例', providers[k].swas)}
+      ${renderGroup('ECS 实例', providers[k].ecs)}
+      ${renderGroup('域名', providers[k].domains)}
+    </div>`).join('');
+  $('resBody').innerHTML = `
+    <div class="card shadow-sm">
+      <div class="card-header fw-bold">${esc(p.name)}</div>
+      <div class="card-body">
+        <ul class="nav nav-tabs mb-2">${tabs}</ul>
+        <div class="tab-content">${panes}</div>
+      </div>
+    </div>`;
+}
+
+function renderGroup(title, g) {
+  if (!g.ok) {
+    return `<div class="mt-2"><h6 class="d-inline-block me-2">${title}</h6>
+      <span class="badge bg-danger">查询失败</span>
+      <div class="alert alert-warning py-1 px-2 small">${esc(g.error || '未知错误')}</div></div>`;
+  }
+  if (!g.items.length) {
+    const tip = g.error ? ` <span class="text-muted small">${esc(g.error)}</span>` : '';
+    return `<div class="mt-2"><h6 class="d-inline-block me-2">${title}</h6>
+      <span class="text-muted small">无资源</span>${tip}</div>`;
+  }
+  const rows = g.items.map(it => {
+    const exp = it.expired_at ? fmtBjt(it.expired_at) : '—';
+    const left = it.days_left == null ? '—' : dlBadge(it.days_left);
+    const renew = it.auto_renew ? ' <span class="badge bg-info">自动续费</span>' : '';
+    const status = it.status ? esc(it.status) : '—';
+    return `<tr>
+      <td>${esc(it.name)}${renew}</td>
+      <td class="small text-muted">${esc(it.id)}</td>
+      <td>${esc(it.region)}</td>
+      <td>${status}</td>
+      <td class="small">${exp}</td>
+      <td>${left}</td>
+    </tr>`;
+  }).join('');
+  return `<div class="mt-3"><h6 class="d-inline-block me-2">${title}</h6>
+    <span class="badge bg-secondary">${g.items.length}</span>
+    <div class="table-responsive"><table class="table table-sm table-hover align-middle mb-0">
+      <thead><tr><th>名称</th><th>ID</th><th>地域</th><th>状态</th><th>到期时间（北京）</th><th>剩余</th></tr></thead>
+      <tbody>${rows}</tbody></table></div></div>`;
+}
+
+function fmtBjt(iso) {
+  const d = new Date(iso);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function dlBadge(d) {
+  const cls = d <= 0 ? 'bg-danger' : d <= 30 ? 'bg-warning text-dark' : 'bg-success';
+  const label = d <= 0 ? `已过期 ${-d} 天` : `剩 ${d} 天`;
+  return `<span class="badge ${cls}">${label}</span>`;
+}
+
+$('resRefreshBtn').onclick = refreshResources;
+
 // ---- 项目配置页 ----
 let cfgLoaded = false, currentProject = null, rawMode = false;
 
@@ -224,21 +362,47 @@ function selectProject(name) {
     else $('projectEditor').innerHTML = '<p class="text-muted">暂无项目，点击左上角新增</p>';
   };
   $('addProviderBtn').onclick = () => {
-    const kind = prompt('服务商 kind（如 aliyun）');
-    if (!kind) return;
-    const wrap = document.createElement('div');
-    wrap.className = 'border rounded p-2 mb-2 provider-block';
-    wrap.dataset.kind = kind;
-    wrap.innerHTML = `<div class="d-flex justify-content-between"><strong>${esc(kind)}</strong>
-      <button class="btn btn-sm btn-outline-danger del-provider">删除</button></div>
-      <div class="row g-2 mt-1">
-        <div class="col-4"><input class="form-control form-control-sm prov-region" placeholder="region"></div>
-        <div class="col-4"><input class="form-control form-control-sm prov-ak" placeholder="access_key_id"></div>
-        <div class="col-4"><input type="password" class="form-control form-control-sm prov-sk" placeholder="access_key_secret"></div>
-      </div>`;
-    wrap.querySelector('.del-provider').onclick = () => wrap.remove();
-    ed.insertBefore(wrap, $('addProviderBtn').parentNode);
+    // 内联下拉选择服务商 kind（列表来自后端 /api/providers，唯一权威来源）
+    const list = window.__providers || [];
+    if (!list.length) { alert('当前无可用的服务商'); return; }
+    const holder = document.createElement('div');
+    holder.className = 'mb-2 d-flex gap-2 align-items-center';
+    holder.innerHTML = `
+      <select class="form-select form-select-sm add-prov-select" style="max-width:220px">
+        ${list.map(k => `<option value="${esc(k)}">${esc(k)}</option>`).join('')}
+      </select>
+      <button class="btn btn-sm btn-primary add-prov-ok">确定</button>
+      <button class="btn btn-sm btn-outline-secondary add-prov-cancel">取消</button>`;
+    $('addProviderBtn').insertAdjacentElement('beforebegin', holder);
+    $('addProviderBtn').disabled = true;
+    holder.querySelector('.add-prov-cancel').onclick = () => {
+      holder.remove();
+      $('addProviderBtn').disabled = false;
+    };
+    holder.querySelector('.add-prov-ok').onclick = () => {
+      const kind = holder.querySelector('.add-prov-select').value;
+      holder.remove();
+      $('addProviderBtn').disabled = false;
+      if (!kind) return;
+      ed.insertBefore(createProviderBlock(kind), $('addProviderBtn').parentNode);
+    };
   };
+}
+
+// 构建一个服务商编辑块（配置页）
+function createProviderBlock(kind) {
+  const wrap = document.createElement('div');
+  wrap.className = 'border rounded p-2 mb-2 provider-block';
+  wrap.dataset.kind = kind;
+  wrap.innerHTML = `<div class="d-flex justify-content-between"><strong>${esc(kind)}</strong>
+    <button class="btn btn-sm btn-outline-danger del-provider">删除</button></div>
+    <div class="row g-2 mt-1">
+      <div class="col-4"><input class="form-control form-control-sm prov-region" placeholder="region"></div>
+      <div class="col-4"><input class="form-control form-control-sm prov-ak" placeholder="access_key_id"></div>
+      <div class="col-4"><input type="password" class="form-control form-control-sm prov-sk" placeholder="access_key_secret"></div>
+    </div>`;
+  wrap.querySelector('.del-provider').onclick = () => wrap.remove();
+  return wrap;
 }
 
 function collectProjects() {
@@ -367,5 +531,13 @@ async function loadHistory() {
 }
 setInterval(() => { if (!location.hash.includes('history')) return; loadHistory(); }, 5000);
 
+// 从后端获取当前接入的服务商列表（供配置页“添加服务商”下拉使用）
+async function loadProviders() {
+  try {
+    const d = await api('/api/providers');
+    window.__providers = d.providers || [];
+  } catch (e) { window.__providers = []; }
+}
+
 // ---- 启动 ----
-if (!TOKEN) showLogin(); else route();
+if (!TOKEN) showLogin(); else { loadProviders(); route(); }

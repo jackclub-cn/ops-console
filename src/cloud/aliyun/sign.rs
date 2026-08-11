@@ -48,8 +48,12 @@ pub fn sign_params(
         ("SignatureNonce".into(), nonce),
         ("SignatureVersion".into(), "1.0".into()),
         ("Timestamp".into(), timestamp),
-        ("RegionId".into(), region_id.to_string()),
     ];
+    // 全局服务（如域名 domain）不传 RegionId：RPC 签名只对实际发送的参数签名，
+    // 不带 RegionId 完全合法；区域化服务（SWAS/ECS/CMS）照常携带。
+    if !region_id.is_empty() {
+        params.push(("RegionId".into(), region_id.to_string()));
+    }
     for (k, v) in extra {
         params.push((k.to_string(), v.to_string()));
     }

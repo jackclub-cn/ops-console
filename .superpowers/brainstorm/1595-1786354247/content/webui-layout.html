@@ -1,0 +1,104 @@
+<h2>Web UI 整体布局（Bootstrap 5 单页）</h2>
+<p class="subtitle">三个页签：运行命令 / 项目配置 / 运行历史。先看下面三个页面的线框，在终端告诉我哪里需要调整。</p>
+
+<div class="section">
+  <h3>页面 1 · 运行命令（默认首页）</h3>
+  <div class="mockup">
+    <div class="mockup-header">运行命令</div>
+    <div class="mockup-body">
+      <div class="mock-nav">ops-console | 运行命令 | 项目配置 | 运行历史</div>
+      <div style="display:flex;gap:16px;padding:12px">
+        <div style="flex:0 0 300px;background:#f1f3f5;border:1px dashed #adb5bd;border-radius:6px;padding:12px">
+          <div class="label">参数表单</div>
+          <div>命令: <span style="display:inline-block;padding:2px 10px;background:#fff;border:1px solid #ced4da;border-radius:4px">snapshot ▾</span></div>
+          <div style="margin-top:8px">项目: <span style="display:inline-block;padding:2px 10px;background:#fff;border:1px solid #ced4da;border-radius:4px">全部项目 ▾</span></div>
+          <div style="margin-top:8px">服务商: <span style="display:inline-block;padding:2px 10px;background:#fff;border:1px solid #ced4da;border-radius:4px">全部 ▾</span></div>
+          <div style="margin-top:8px">--keep: <input class="mock-input" style="width:70px" value="2"></div>
+          <div style="margin-top:8px">--wait-minutes: <input class="mock-input" style="width:70px" value="30"></div>
+          <div style="margin-top:12px"><button class="mock-button">▶ 运行</button></div>
+        </div>
+        <div style="flex:1;background:#212529;color:#f8f9fa;border-radius:6px;padding:12px;font-family:monospace;font-size:12px;min-height:220px">
+          <div class="label" style="color:#adb5bd">输出（流式）</div>
+          <div>===== 项目: demo =====</div>
+          <div>-- 服务商: aliyun</div>
+          <div>  -- 实例: web-01 (d-sw-xxxx)</div>
+          <div>  ✓ 快照 snap-xxx 已创建，等待就绪...</div>
+          <div style="color:#20c997">✓ 轮转完成</div>
+          <div style="margin-top:8px"><span style="display:inline-block;padding:1px 8px;background:#0d6efd;color:#fff;border-radius:10px;font-size:11px">运行中</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>页面 2 · 项目配置</h3>
+  <div class="mockup">
+    <div class="mockup-header">项目配置</div>
+    <div class="mockup-body">
+      <div class="mock-nav">ops-console | 运行命令 | 项目配置 | 运行历史</div>
+      <div style="display:flex;gap:16px;padding:12px">
+        <div style="flex:0 0 260px;background:#f1f3f5;border:1px dashed #adb5bd;border-radius:6px;padding:12px">
+          <div class="label">项目列表</div>
+          <div style="display:inline-block;padding:4px 12px;background:#fff;border:2px solid #0d6efd;border-radius:6px;margin-top:6px">demo<br><small>阿里云深圳</small></div>
+          <div style="display:inline-block;padding:4px 12px;background:#fff;border:1px solid #ced4da;border-radius:6px;margin-top:6px">prod</div>
+          <div style="margin-top:12px"><button class="mock-button">+ 新增项目</button></div>
+          <div style="margin-top:12px"><button class="mock-button">通知设置</button></div>
+        </div>
+        <div style="flex:1;background:#f8f9fa;border:1px solid #dee2e6;border-radius:6px;padding:12px">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div class="label">编辑项目: demo</div>
+            <button class="mock-button">切换到 YAML 原文</button>
+          </div>
+          <div style="margin-top:8px">名称: <input class="mock-input" value="demo"></div>
+          <div style="margin-top:8px">描述: <input class="mock-input" style="width:70%" value="示例项目：阿里云深圳轻量服务器快照轮转"></div>
+          <div class="label" style="margin-top:12px">服务商 aliyun</div>
+          <div style="margin-top:6px">region: <input class="mock-input" value="cn-shenzhen"></div>
+          <div style="margin-top:6px">access_key_id: <input class="mock-input" value="LTAI********"></div>
+          <div style="margin-top:6px">access_key_secret: <input class="mock-input" type="password" value="••••••••"></div>
+          <div style="margin-top:8px"><button class="mock-button">+ 添加服务商</button> <button class="mock-button">删除项目</button></div>
+          <div style="margin-top:12px"><button class="mock-button" style="background:#0d6efd;color:#fff">保存配置</button></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>页面 3 · 运行历史</h3>
+  <div class="mockup">
+    <div class="mockup-header">运行历史</div>
+    <div class="mockup-body">
+      <div class="mock-nav">ops-console | 运行命令 | 项目配置 | 运行历史</div>
+      <div style="padding:12px">
+        <table style="width:100%;border-collapse:collapse;font-size:12px">
+          <tr style="background:#f1f3f5">
+            <th style="padding:6px;border:1px solid #dee2e6;text-align:left">时间</th>
+            <th style="padding:6px;border:1px solid #dee2e6;text-align:left">命令</th>
+            <th style="padding:6px;border:1px solid #dee2e6;text-align:left">参数</th>
+            <th style="padding:6px;border:1px solid #dee2e6;text-align:left">状态</th>
+            <th style="padding:6px;border:1px solid #dee2e6;text-align:left">耗时</th>
+            <th style="padding:6px;border:1px solid #dee2e6;text-align:left"></th>
+          </tr>
+          <tr>
+            <td style="padding:6px;border:1px solid #dee2e6">03-15 09:00</td>
+            <td style="padding:6px;border:1px solid #dee2e6">snapshot</td>
+            <td style="padding:6px;border:1px solid #dee2e6">--keep 2</td>
+            <td style="padding:6px;border:1px solid #dee2e6"><span style="color:#198754">✓ 成功</span></td>
+            <td style="padding:6px;border:1px solid #dee2e6">2m 31s</td>
+            <td style="padding:6px;border:1px solid #dee2e6"><button class="mock-button">查看输出</button></td>
+          </tr>
+          <tr>
+            <td style="padding:6px;border:1px solid #dee2e6">03-15 08:00</td>
+            <td style="padding:6px;border:1px solid #dee2e6">expiry</td>
+            <td style="padding:6px;border:1px solid #dee2e6">--days 30,15,3</td>
+            <td style="padding:6px;border:1px solid #dee2e6"><span style="color:#dc3545">✗ 失败</span></td>
+            <td style="padding:6px;border:1px solid #dee2e6">12s</td>
+            <td style="padding:6px;border:1px solid #dee2e6"><button class="mock-button">查看输出</button></td>
+          </tr>
+        </table>
+        <p style="margin-top:8px;color:#6c757d">任务详情点击后弹出模态框显示完整输出（或复用运行页的输出面板）</p>
+      </div>
+    </div>
+  </div>
+</div>

@@ -73,6 +73,13 @@ enum Command {
         days: String,
     },
 
+    /// 域名到期提醒：命中阈值（或已过期）时输出并通知（域名是账号级全局资源）
+    ExpiryDomain {
+        /// 提醒阈值（天），逗号分隔
+        #[arg(long, default_value = "30,15,3")]
+        days: String,
+    },
+
     /// 磁盘占用检查：使用率超阈值（默认 90%）或数据缺失时输出并通知
     Disk {
         /// 磁盘使用率阈值（%），达到则告警
@@ -141,18 +148,7 @@ async fn main() -> anyhow::Result<()> {
             errors
         }
         Command::Expiry { days } => {
-            let thresholds: Vec<i64> = days
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(|s| {
-                    s.parse::<i64>()
-                        .map_err(|_| anyhow::anyhow!("--days 参数无效: {s:?}（格式如 30,15,3）"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            if thresholds.is_empty() {
-                anyhow::bail!("--days 至少需要一个阈值（如 30,15,3）");
-            }
+            let thresholds = parse_thresholds(&days)?;
 
             let targets = select_projects(&cfg, cli.project.as_deref())?;
 
@@ -229,6 +225,63 @@ async fn main() -> anyhow::Result<()> {
 
             if !errors.is_empty() {
                 anyhow::bail!("以下服务商检查失败: {}", errors.join(", "));
+            }
+            Vec::new()
+        }
+        Command::ExpiryDomain { days } => {
+            let thresholds = parse_thresholds(&days)?;
+            let targets = select_projects(&cfg, cli.project.as_deref())?;
+
+            // 域名是账号级全局资源，每个项目查一次（不受地域影响）
+            let notifier = crate::notify::from_config(&cfg.notify)?;
+            let mut alerts: Vec<(String, String, ops::expiry::DomainAlert)> = Vec::new();
+            let mut errors = Vec::new();
+            for project in &targets {
+                println!("\n===== 项目: {} =====", project.name);
+                let do_aliyun = match cli.provider.as_deref() {
+                    Some(k) => k == "aliyun",
+                    None => project.providers.contains_key("aliyun"),
+                };
+                if do_aliyun {
+                    match run_provider_domain_expiry(&cfg, project, "aliyun", &thresholds).await {
+                        Ok(list) => alerts.extend(list.into_iter().map(|a| {
+                            (project.name.clone(), "aliyun".to_string(), a)
+                        })),
+                        Err(e) => {
+                            if cloud::aliyun::is_permission_error(&e) {
+                                // 账号未开通/未授权域名服务（如无域名资源）→ 跳过，不视为失败
+                                println!("  跳过域名检查（无 domain 权限，可能未注册域名）");
+                            } else {
+                                println!("域名到期检查失败: {e:#}");
+                                errors.push("aliyun".to_string());
+                            }
+                        }
+                    }
+                } else {
+                    println!("  未配置 aliyun 服务商，跳过");
+                }
+            }
+
+            if !alerts.is_empty() {
+                let text = ops::expiry::render_domains(&alerts);
+                println!("{text}");
+                if let Some(n) = &notifier {
+                    let title = format!("域名到期提醒: {} 个需关注", alerts.len());
+                    if let Err(e) = n.send(&title, &text).await {
+                        tracing::warn!("通知发送失败: {e}");
+                    }
+                }
+            } else {
+                let list = thresholds
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("全部域名均在安全期内（{list} 天内无到期）");
+            }
+
+            if !errors.is_empty() {
+                anyhow::bail!("以下项目域名检查失败: {}", errors.join(", "));
             }
             Vec::new()
         }
@@ -322,6 +375,23 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 解析 --days 阈值列表（如 "30,15,3"）
+fn parse_thresholds(days: &str) -> anyhow::Result<Vec<i64>> {
+    let thresholds: Vec<i64> = days
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<i64>()
+                .map_err(|_| anyhow::anyhow!("--days 参数无效: {s:?}（格式如 30,15,3）"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if thresholds.is_empty() {
+        anyhow::bail!("--days 至少需要一个阈值（如 30,15,3）");
+    }
+    Ok(thresholds)
+}
+
 /// 对单个项目的全部（或 --provider 指定的）服务商执行快照轮转。
 async fn run_project_rotate(
     cfg: &config::Config,
@@ -367,7 +437,7 @@ async fn run_provider_rotate(
         "aliyun" => {
             let pcfg = cfg.provider(project, kind)?;
             let (ak, sk) = pcfg.aliyun_credentials()?;
-            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region);
+            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region).await?;
             rotate_provider(&provider, &cfg.notify, keep, wait_minutes).await
         }
         other => anyhow::bail!("服务商 {other:?} 尚未实现（目前仅支持: aliyun）"),
@@ -385,7 +455,7 @@ async fn run_provider_expiry(
         "aliyun" => {
             let pcfg = cfg.provider(project, kind)?;
             let (ak, sk) = pcfg.aliyun_credentials()?;
-            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region);
+            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region).await?;
             ops::expiry::check(&provider, thresholds, chrono::Utc::now()).await
         }
         other => anyhow::bail!("服务商 {other:?} 尚未实现（目前仅支持: aliyun）"),
@@ -403,8 +473,63 @@ async fn run_provider_disk_swas(
         "aliyun" => {
             let pcfg = cfg.provider(project, kind)?;
             let (ak, sk) = pcfg.aliyun_credentials()?;
-            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region);
-            ops::disk::check_swas_disk(provider.swas(), threshold).await
+            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region).await?;
+            // 跨地域汇总：单地域失败仅汇总跳过（global 可能含未开通地域），全部失败才报错
+            let mut over = Vec::new();
+            let mut missing = Vec::new();
+            let mut failed: Vec<String> = Vec::new();
+            let mut no_perm: Vec<String> = Vec::new();
+            let mut first_err: Option<anyhow::Error> = None;
+            for g in provider.groups() {
+                match ops::disk::check_swas_disk(&g.swas, &g.region, threshold).await {
+                    Ok((o, m)) => {
+                        over.extend(o);
+                        missing.extend(m);
+                    }
+                    Err(e) => {
+                        if cloud::aliyun::is_permission_error(&e) {
+                            no_perm.push(g.region.clone());
+                        } else {
+                            failed.push(g.region.clone());
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                        }
+                    }
+                }
+            }
+            if !no_perm.is_empty() {
+                println!("  跳过 {} 个地域（无 SWAS 权限，可能未购买/未授权）: {}", no_perm.len(), no_perm.join(", "));
+            }
+            if !failed.is_empty() && over.is_empty() && missing.is_empty() && no_perm.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "全部 {} 个地域 SWAS 磁盘检查失败（首个错误: {:#}）",
+                    failed.len(),
+                    first_err.as_ref().map(|e| format!("{e:#}")).unwrap_or_default()
+                ));
+            }
+            if !failed.is_empty() {
+                println!("  跳过 {} 个地域（SWAS 磁盘检查失败）: {}", failed.len(), failed.join(", "));
+            }
+            Ok((over, missing))
+        }
+        other => anyhow::bail!("服务商 {other:?} 尚未实现（目前仅支持: aliyun）"),
+    }
+}
+
+/// 单服务商域名到期检查（域名是账号级全局服务，与地域无关，直接构造全局客户端）。
+async fn run_provider_domain_expiry(
+    cfg: &config::Config,
+    project: &config::Project,
+    kind: &str,
+    thresholds: &[i64],
+) -> anyhow::Result<Vec<ops::expiry::DomainAlert>> {
+    match kind {
+        "aliyun" => {
+            let pcfg = cfg.provider(project, kind)?;
+            let (ak, sk) = pcfg.aliyun_credentials()?;
+            let client = cloud::aliyun::domain::DomainClient::new(&ak, &sk);
+            ops::expiry::check_domains(&client, thresholds, chrono::Utc::now()).await
         }
         other => anyhow::bail!("服务商 {other:?} 尚未实现（目前仅支持: aliyun）"),
     }
@@ -421,8 +546,44 @@ async fn run_provider_disk_ecs(
         "aliyun" => {
             let pcfg = cfg.provider(project, kind)?;
             let (ak, sk) = pcfg.aliyun_credentials()?;
-            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region);
-            ops::disk::check_ecs_disk(provider.ecs(), provider.cms(), threshold).await
+            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region).await?;
+            let mut over = Vec::new();
+            let mut missing = Vec::new();
+            let mut failed: Vec<String> = Vec::new();
+            let mut no_perm: Vec<String> = Vec::new();
+            let mut first_err: Option<anyhow::Error> = None;
+            for g in provider.groups() {
+                match ops::disk::check_ecs_disk(&g.ecs, &g.cms, threshold).await {
+                    Ok((o, m)) => {
+                        over.extend(o);
+                        missing.extend(m);
+                    }
+                    Err(e) => {
+                        if cloud::aliyun::is_permission_error(&e) {
+                            no_perm.push(g.region.clone());
+                        } else {
+                            failed.push(g.region.clone());
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                        }
+                    }
+                }
+            }
+            if !no_perm.is_empty() {
+                println!("  跳过 {} 个地域（无 ECS 权限，可能未购买/未授权）: {}", no_perm.len(), no_perm.join(", "));
+            }
+            if !failed.is_empty() && over.is_empty() && missing.is_empty() && no_perm.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "全部 {} 个地域 ECS 磁盘检查失败（首个错误: {:#}）",
+                    failed.len(),
+                    first_err.as_ref().map(|e| format!("{e:#}")).unwrap_or_default()
+                ));
+            }
+            if !failed.is_empty() {
+                println!("  跳过 {} 个地域（ECS 磁盘检查失败）: {}", failed.len(), failed.join(", "));
+            }
+            Ok((over, missing))
         }
         other => anyhow::bail!("服务商 {other:?} 尚未实现（目前仅支持: aliyun）"),
     }
@@ -534,8 +695,40 @@ async fn run_provider_ecs_autosnapshot(
         "aliyun" => {
             let pcfg = cfg.provider(project, kind)?;
             let (ak, sk) = pcfg.aliyun_credentials()?;
-            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region);
-            ops::ecs::check_auto_snapshot(provider.ecs()).await
+            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region).await?;
+            let mut out = Vec::new();
+            let mut failed: Vec<String> = Vec::new();
+            let mut no_perm: Vec<String> = Vec::new();
+            let mut first_err: Option<anyhow::Error> = None;
+            for g in provider.groups() {
+                match ops::ecs::check_auto_snapshot(&g.ecs).await {
+                    Ok(list) => out.extend(list),
+                    Err(e) => {
+                        if cloud::aliyun::is_permission_error(&e) {
+                            no_perm.push(g.region.clone());
+                        } else {
+                            failed.push(g.region.clone());
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                        }
+                    }
+                }
+            }
+            if !no_perm.is_empty() {
+                println!("  跳过 {} 个地域（无 ECS 权限，可能未购买/未授权）: {}", no_perm.len(), no_perm.join(", "));
+            }
+            if !failed.is_empty() && out.is_empty() && no_perm.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "全部 {} 个地域 ECS 自动快照检查失败（首个错误: {:#}）",
+                    failed.len(),
+                    first_err.as_ref().map(|e| format!("{e:#}")).unwrap_or_default()
+                ));
+            }
+            if !failed.is_empty() {
+                println!("  跳过 {} 个地域（ECS 自动快照检查失败）: {}", failed.len(), failed.join(", "));
+            }
+            Ok(out)
         }
         other => anyhow::bail!("服务商 {other:?} 尚未实现（目前仅支持: aliyun）"),
     }
@@ -552,8 +745,39 @@ async fn run_provider_ecs_expiry(
         "aliyun" => {
             let pcfg = cfg.provider(project, kind)?;
             let (ak, sk) = pcfg.aliyun_credentials()?;
-            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region);
-            let servers = provider.ecs().list_servers().await?;
+            let provider = cloud::aliyun::AliyunProvider::new(&ak, &sk, &pcfg.region).await?;
+            let mut servers = Vec::new();
+            let mut failed: Vec<String> = Vec::new();
+            let mut no_perm: Vec<String> = Vec::new();
+            let mut first_err: Option<anyhow::Error> = None;
+            for g in provider.groups() {
+                match g.ecs.list_servers().await {
+                    Ok(s) => servers.extend(s),
+                    Err(e) => {
+                        if cloud::aliyun::is_permission_error(&e) {
+                            no_perm.push(g.region.clone());
+                        } else {
+                            failed.push(g.region.clone());
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                        }
+                    }
+                }
+            }
+            if !no_perm.is_empty() {
+                println!("  跳过 {} 个地域（无 ECS 权限，可能未购买/未授权）: {}", no_perm.len(), no_perm.join(", "));
+            }
+            if !failed.is_empty() && servers.is_empty() && no_perm.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "全部 {} 个地域 ECS 查询失败（首个错误: {:#}）",
+                    failed.len(),
+                    first_err.as_ref().map(|e| format!("{e:#}")).unwrap_or_default()
+                ));
+            }
+            if !failed.is_empty() {
+                println!("  跳过 {} 个地域（ECS 查询失败）: {}", failed.len(), failed.join(", "));
+            }
             Ok(ops::expiry::check_servers(servers, thresholds, chrono::Utc::now()))
         }
         other => anyhow::bail!("服务商 {other:?} 尚未实现（目前仅支持: aliyun）"),
@@ -598,6 +822,14 @@ async fn rotate_provider<P: CloudProvider + ?Sized>(
             Err(e) => {
                 println!("    实例 {} 轮转失败: {e:#}", server.name);
                 errors.push(server.name.clone());
+                // 失败也发钉钉通知（及时告警，不依赖 cron 日志回看）
+                if let Some(n) = &notifier {
+                    let title = format!("快照轮转失败: {}", server.name);
+                    let text = format!("实例 {} ({}) 快照轮转失败:\n{e:#}", server.name, server.id);
+                    if let Err(se) = n.send(&title, &text).await {
+                        tracing::warn!("失败通知发送失败: {se}");
+                    }
+                }
             }
         }
     }

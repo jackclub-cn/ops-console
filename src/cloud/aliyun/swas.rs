@@ -39,6 +39,18 @@ pub struct SwasInstance {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct ListRegionsResponse {
+    #[serde(rename = "Regions", default)]
+    pub regions: Vec<SwasRegion>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SwasRegion {
+    #[serde(rename = "RegionId")]
+    pub region_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ListDisksResponse {
     #[serde(rename = "Disks", default)]
     pub disks: Vec<SwasDisk>,
@@ -114,6 +126,15 @@ impl SwasClient {
                 (resp.instances, resp.total_count)
             })
             .await
+    }
+
+    /// 查询全部可用地域（全局接口，与调用地域无关；用于 region=global 自动发现）
+    pub async fn list_regions(&self) -> Result<Vec<String>> {
+        let resp: ListRegionsResponse = self
+            .rpc
+            .call("ListRegions", SWAS_API_VERSION, &[])
+            .await?;
+        Ok(resp.regions.into_iter().map(|r| r.region_id).collect())
     }
 
     pub async fn list_snapshots(&self, instance_id: &str) -> Result<Vec<SwasSnapshot>> {

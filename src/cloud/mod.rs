@@ -5,6 +5,11 @@
 
 pub mod aliyun;
 
+/// 当前已接入的云服务商 kind 列表（唯一权威来源）。
+/// 前端配置页“添加服务商”下拉、资源页 provider Tab 均从此处获取；
+/// 接入新服务商（tencent/aws…）时在此追加，前端无需改动。
+pub const SUPPORTED_PROVIDERS: &[&str] = &["aliyun"];
+
 use serde::{Deserialize, Serialize};
 
 /// 统一的服务器/实例抽象（跨服务商）
@@ -63,4 +68,24 @@ pub trait CloudProvider: Send + Sync {
         snapshot_id: &str,
         timeout: std::time::Duration,
     ) -> anyhow::Result<()>;
+}
+
+/// 渲染用的地域后缀：非空时输出 ", cn-shenzhen"，空时输出空串
+pub fn region_suffix(region: &str) -> String {
+    if region.is_empty() {
+        String::new()
+    } else {
+        format!(", {region}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_region_suffix() {
+        assert_eq!(region_suffix("cn-shenzhen"), ", cn-shenzhen");
+        assert_eq!(region_suffix(""), "");
+    }
 }

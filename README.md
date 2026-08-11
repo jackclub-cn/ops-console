@@ -72,7 +72,8 @@ YAML 文档根即项目数组，每个项目下 `providers.<kind>` 配置服务�
   description: 示例项目
   providers:
     aliyun:
-      region: cn-shenzhen
+      region: global          # 留空或不写 = global：自动发现账号下全部地域；
+                              # 固定单地域则填如 cn-shenzhen
       access_key_id: ""        # 留空则用环境变量
       access_key_secret: ""
 
@@ -83,6 +84,14 @@ YAML 文档根即项目数组，每个项目下 `providers.<kind>` 配置服务�
       access_key_id: ""
       access_key_secret: ""
 ```
+
+> **region 两种模式**：留空 / `global` = 自动发现账号下全部地域（SWAS `ListRegions` ∪ ECS `DescribeRegions`），
+> 所有命令跨地域汇总巡检，适合"一个项目 = 一个阿里云运维账号"的全量运维；具体地域（如 `cn-shenzhen`）= 固定单地域。
+> 跨地域模式下：单地域查询失败仅告警跳过（可能包含未开通/无权限的地域），全部失败才报错；
+> 提醒/检查结果按 `实例名 (ID, 地域)` 展示，方便区分。
+>
+> **目录加速**：global 模式优先用**资源中心**（`resourcecenter:SearchResources`）拿到账号下实际有实例的地域，
+> 只巡检这些地域（实测 32 地域遍历 17.6s → 0.9s）；未授予该权限时自动回退到 `ListRegions`/`DescribeRegions` 全量遍历。
 
 ### notify.yml（通知渠道，可选）
 
@@ -124,6 +133,9 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
   expiry [--days 30,15,3]
                              到期提醒：检查 SWAS + ECS 全部实例到期时间，命中阈值
                              （或已过期）时输出并汇总发一条通知；无命中则不通知
+  expiry-domain [--days 30,15,3]
+                             域名到期提醒：账号级全局资源（与地域无关），检查全部域名
+                             到期时间；开启自动续费的域名会标注；无命中则不通知
   disk [--threshold 90]
                              磁盘占用检查：SWAS + ECS 全部 Running 实例，
                              使用率达到阈值或数据缺失时输出并汇总发一条通知
@@ -151,6 +163,8 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
 
 轻量（SWAS）最小权限策略（注意 Action 前缀是 `swas-open:` 而非 `swas:`）：
 
+> global 模式需要额外授予 `swas-open:ListRegions` / `ecs:DescribeRegions`（自动发现地域用）。
+
 ```json
 {
   "Version": "1",
@@ -163,7 +177,8 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
         "swas-open:ListSnapshots",
         "swas-open:CreateSnapshot",
         "swas-open:DeleteSnapshot",
-        "swas-open:DescribeMonitorData"
+        "swas-open:DescribeMonitorData",
+        "swas-open:ListRegions"
       ],
       "Resource": "*"
     }
@@ -172,6 +187,8 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
 ```
 
 ECS 只读检查最小权限策略：
+
+> global 模式需要额外授予 `ecs:DescribeRegions`。
 
 ```json
 {
@@ -183,8 +200,39 @@ ECS 只读检查最小权限策略：
         "ecs:DescribeInstances",
         "ecs:DescribeDisks",
         "ecs:DescribeAutoSnapshotPolicyEx",
+        "ecs:DescribeRegions",
         "cms:QueryMetricLast"
       ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+域名到期提醒（`expiry-domain`）最小权限策略（域名是全局服务，`RamCode` 为 `domain`）：
+
+```json
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "domain:QueryCommonInfo",
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+global 模式目录加速（可选但强烈建议，将地域遍历从 32 个缩到实际有实例的 1-2 个）：
+
+```json
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "resourcecenter:SearchResources",
       "Resource": "*"
     }
   ]

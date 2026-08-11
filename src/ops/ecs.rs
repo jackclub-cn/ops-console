@@ -84,8 +84,10 @@ pub fn render_autosnapshot(items: &[(String, String, AutoSnapshotStatus)]) -> St
             format!("磁盘: {}", disks.join(", "))
         };
         out.push_str(&format!(
-            "- {project}/{kind}: {} ({}) [{mark}] {detail}\n",
-            s.server.name, s.server.id
+            "- {project}/{kind}: {} ({}{}) [{mark}] {detail}\n",
+            s.server.name,
+            s.server.id,
+            crate::cloud::region_suffix(&s.server.region)
         ));
     }
     out
@@ -161,7 +163,7 @@ mod tests {
             ),
         ];
         let text = render_autosnapshot(&items);
-        assert!(text.contains("web (i-web) [已开启] 策略: 每日快照（触发 00:00，保留 7 天）"));
-        assert!(text.contains("db (i-db) [未开启] 磁盘: d-2 (system)"));
+        assert!(text.contains("web (i-web, cn-shenzhen) [已开启] 策略: 每日快照（触发 00:00，保留 7 天）"));
+        assert!(text.contains("db (i-db, cn-shenzhen) [未开启] 磁盘: d-2 (system)"));
     }
 }

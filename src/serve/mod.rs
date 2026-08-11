@@ -21,6 +21,8 @@ pub struct AppState {
     pub config_dir: PathBuf,
     pub validator: auth::TokenValidator,
     pub tasks: Arc<tasks::TaskManager>,
+    /// 项目资源快照缓存（启动预取 / 配置变更刷新 / 手动刷新）
+    pub resources: Arc<api::ResourceCache>,
 }
 
 const INDEX_HTML: &str = include_str!("static/index.html");
@@ -42,7 +44,21 @@ pub async fn run(
         config_dir: config_dir.clone(),
         validator: auth::TokenValidator::new(&token),
         tasks: tasks::TaskManager::new(config_dir)?, // 返回 Arc<Self>（内部已启动 worker）
+        resources: Arc::new(api::ResourceCache::default()),
     };
+
+    // 启动时后台预取项目资源快照（不阻塞 serve 启动）
+    {
+        let resources = state.resources.clone();
+        let dir = state.config_dir.clone();
+        tokio::spawn(async move {
+            resources.mark_loading();
+            match api::gather_resources(&dir).await {
+                Ok(v) => resources.set(v["projects"].clone()),
+                Err(e) => resources.set_error(format!("{e:#}")),
+            }
+        });
+    }
 
     let app = Router::new()
         .route("/", get(serve_index))
@@ -57,7 +73,10 @@ pub async fn run(
             axum::routing::get(api::get_raw).post(api::save_raw),
         )
         .route("/api/run", axum::routing::post(api::run))
+        .route("/api/resources", axum::routing::get(api::list_resources))
+        .route("/api/resources/refresh", axum::routing::post(api::refresh_resources))
         .route("/api/tasks", axum::routing::get(api::list_tasks))
+        .route("/api/providers", axum::routing::get(api::providers))
         .route("/api/tasks/current", axum::routing::get(api::current_task))
         .route(
             "/api/tasks/current/stream",
@@ -153,6 +172,7 @@ mod tests {
             config_dir: dir,
             validator: auth::TokenValidator::new("tok"),
             tasks,
+            resources: Arc::new(api::ResourceCache::default()),
         }
     }
 

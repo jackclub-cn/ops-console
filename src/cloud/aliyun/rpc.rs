@@ -74,19 +74,38 @@ impl RpcClient {
             .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join("&");
-        let url = format!("https://{}.{}.aliyuncs.com/?{}", self.product, self.region, query);
+        // 全局服务（region 为空）：https://{product}.aliyuncs.com（如 domain），
+        // 不拼地域段；区域化服务照常 {product}.{region}.aliyuncs.com
+        let url = if self.region.is_empty() {
+            format!("https://{}.aliyuncs.com/?{}", self.product, query)
+        } else {
+            format!(
+                "https://{}.{}.aliyuncs.com/?{}",
+                self.product, self.region, query
+            )
+        };
 
-        let resp = self.http.get(&url).send().await?;
+        let resp = match self.http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // without_url：reqwest 错误 display 会包含完整请求 URL（含 AccessKeyId / Signature 等参数），
+                // 去掉 URL 避免把凭据信息打进日志
+                return Err(anyhow!(
+                    "阿里云 {} API 请求失败 ({action}): {}",
+                    self.product,
+                    e.without_url()
+                ));
+            }
+        };
         let status = resp.status();
         let text = resp.text().await?;
 
         if !status.is_success() {
             return Err(anyhow!(
-                "阿里云 {} API HTTP {} ({}): {}",
+                "阿里云 {} API HTTP {} ({action}): {}",
                 self.product,
                 status.as_u16(),
-                action,
-                truncate(&text, 500)
+                brief_http_error(&text)
             ));
         }
 
@@ -140,6 +159,29 @@ impl RpcClient {
     }
 }
 
+/// 错误响应文本 → 摘要：解析 JSON 取 Code/Message（截断 200 字符）。
+/// 403/404 等响应里 EncodedDiagnosticMessage 等字段超长，直接截断原始文本会保留无价值噪音。
+fn brief_http_error(text: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
+        let code = v.get("Code").and_then(|c| c.as_str()).unwrap_or_default();
+        let msg = v.get("Message").and_then(|m| m.as_str()).unwrap_or_default();
+        if !code.is_empty() || !msg.is_empty() {
+            let mut s = String::new();
+            if !code.is_empty() {
+                s.push_str(code);
+            }
+            if !msg.is_empty() {
+                if !s.is_empty() {
+                    s.push_str(": ");
+                }
+                s.push_str(msg);
+            }
+            return truncate(&s, 200);
+        }
+    }
+    truncate(text, 200)
+}
+
 pub fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -165,19 +207,65 @@ fn business_error(value: &serde_json::Value, ok_codes: &[&str]) -> Option<String
     }
 }
 
-/// 解析阿里云 ISO8601 到期时间（UTC）；空串/解析失败返回 None
+/// 解析阿里云 ISO8601 到期时间（UTC）；空串/解析失败返回 None。
+/// 兼容两种格式：
+/// - SWAS：`2027-08-08T16:00:00+00:00`（标准 RFC3339）
+/// - ECS 包年包月：`2027-11-28T16:00Z`（**缺秒**，parse_from_rfc3339 直接解析会失败）
 pub fn parse_expired_time(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     if s.is_empty() {
         return None;
     }
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|t| t.with_timezone(&chrono::Utc))
+    parse_rfc3339_lenient(s).map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// 宽松 RFC3339 解析：标准格式优先，缺秒格式（`16:00Z` / `16:00+08:00`）补秒后重试。
+fn parse_rfc3339_lenient(s: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(t);
+    }
+    // 缺秒：从右往左找时区标记（Z / +HH:MM / -HH:MM），在时间后补 ":00"
+    // 注意不能用 rsplit_once（它返回分隔符之后的内容，时区标记会被丢掉）
+    let idx = s.rfind(['Z', '+', '-'])?;
+    let (head, tail) = (&s[..idx], &s[idx..]);
+    let head = head.trim_end_matches(':');
+    let (_, mm) = head.rsplit_once(':')?;
+    if mm.len() != 2 {
+        return None;
+    }
+    let fixed = format!("{head}:00{tail}");
+    chrono::DateTime::parse_from_rfc3339(&fixed).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_expired_time() {
+        use chrono::Utc;
+        // SWAS 标准格式
+        let t = parse_expired_time("2027-08-08T16:00:00+00:00").unwrap();
+        assert_eq!(t, chrono::DateTime::parse_from_rfc3339("2027-08-08T16:00:00Z").unwrap().with_timezone(&Utc));
+        // ECS 缺秒格式（核心回归：之前解析失败 → None）
+        let t = parse_expired_time("2027-11-28T16:00Z").unwrap();
+        assert_eq!(t, chrono::DateTime::parse_from_rfc3339("2027-11-28T16:00:00Z").unwrap().with_timezone(&Utc));
+        // 缺秒 + 时区偏移
+        let t = parse_expired_time("2027-11-28T16:00+08:00").unwrap();
+        assert_eq!(t, chrono::DateTime::parse_from_rfc3339("2027-11-28T08:00:00Z").unwrap().with_timezone(&Utc));
+        // 空/非法 → None
+        assert!(parse_expired_time("").is_none());
+        assert!(parse_expired_time("bad").is_none());
+        assert!(parse_expired_time("2027-13-45T99:99Z").is_none());
+    }
+
+    #[test]
+    fn test_brief_http_error() {
+        // 403 响应：只取 Code/Message，丢弃 EncodedDiagnosticMessage 等超长字段
+        let j = r#"{"Code":"NoPermission","Message":"User is not authorized.","EncodedDiagnosticMessage":"AQIBIAAA..."}"#;
+        assert_eq!(brief_http_error(j), "NoPermission: User is not authorized.");
+        // 无 JSON → 原样截断
+        assert!(brief_http_error("plain text").contains("plain"));
+    }
 
     #[test]
     fn test_business_error() {

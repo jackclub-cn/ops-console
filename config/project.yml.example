@@ -9,8 +9,14 @@
 #   export ALIYUN_ACCESS_KEY_ID=xxxx
 #   export ALIYUN_ACCESS_KEY_SECRET=xxxx
 #
-# 阿里云 RAM 子账号最小权限策略（SWAS 快照轮转 + ECS 只读检查）：
+# region 支持两种模式：
+#   - 留空 / global：自动发现账号下全部地域（SWAS ListRegions ∪ ECS DescribeRegions），
+#     跨地域汇总巡检。适合"一个项目 = 一个阿里云运维账号"的全量运维。
+#   - 具体地域（如 cn-shenzhen）：固定单地域。
+#
+# 阿里云 RAM 子账号最小权限策略（SWAS 快照轮转 + ECS 只读检查 + 地域发现）：
 # 注意：SWAS 的 Action 前缀是 swas-open:（不是 swas:），见官方 API 文档"授权信息"。
+# global 模式额外需要 ListRegions / DescribeRegions（用于自动发现地域）。
 # {
 #   "Version": "1",
 #   "Statement": [
@@ -22,9 +28,13 @@
 #         "swas-open:ListSnapshots",
 #         "swas-open:CreateSnapshot",
 #         "swas-open:DeleteSnapshot",
+#         "swas-open:ListRegions",
 #         "ecs:DescribeInstances",
 #         "ecs:DescribeDisks",
-#         "ecs:DescribeAutoSnapshotPolicyEx"
+#         "ecs:DescribeAutoSnapshotPolicyEx",
+#         "ecs:DescribeRegions",
+#         "domain:QueryCommonInfo",      # expiry-domain 域名到期提醒用
+#         "resourcecenter:SearchResources" # global 目录加速（可选，不加则遍历全部地域）
 #       ],
 #       "Resource": "*"
 #     }
@@ -32,17 +42,18 @@
 # }
 
 - name: demo
-  description: 示例项目：阿里云深圳轻量服务器快照轮转
+  description: 示例项目：阿里云全部地域自动巡检（region 留空 = 自动发现）
   # 每行一个服务商：key 即 kind（如 aliyun / tencent / aws ...），值即该服务商配置
   providers:
     aliyun:
-      region: cn-shenzhen
+      # 留空或不写 = global（自动发现账号下全部地域）；固定单地域则填如 cn-shenzhen
+      region: global
       access_key_id: ""
       access_key_secret: ""
 
-# 第二个项目示例：同账号多区域 / 多项目隔离
+# 第二个项目示例：固定单地域
 # - name: prod
-#   description: 生产环境
+#   description: 生产环境（仅 cn-hangzhou）
 #   providers:
 #     aliyun:
 #       region: cn-hangzhou
