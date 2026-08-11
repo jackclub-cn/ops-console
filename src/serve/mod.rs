@@ -34,6 +34,9 @@ pub async fn run(
     addr: &str,
     token_override: Option<String>,
 ) -> anyhow::Result<()> {
+    // 配置目录不存在时自动创建（UI 可引导首次配置，是 serve 的核心功能）
+    std::fs::create_dir_all(config_dir)
+        .map_err(|e| anyhow::anyhow!("创建配置目录失败 {}: {e}", config_dir.display()))?;
     let (token, generated) = auth::resolve_token(config_dir, token_override, |k| std::env::var(k).ok())?;
     let state = AppState {
         config_dir: config_dir.clone(),
