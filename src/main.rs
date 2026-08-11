@@ -30,7 +30,8 @@ use crate::cloud::CloudProvider;
 )]
 struct Cli {
     /// 配置目录（内含 project.yml / notify.yml）
-    #[arg(long, default_value = "config")]
+    /// global：可写在子命令后（如 serve --config DIR），也可在顶层（ops-console --config DIR serve）
+    #[arg(long, default_value = "config", global = true)]
     config: String,
 
     /// 目标项目名（默认全部项目）
@@ -606,3 +607,24 @@ async fn rotate_provider<P: CloudProvider + ?Sized>(
     Ok(())
 }
 mod serve;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// --config 是 global 参数：子命令前后两种位置都应被接受（serve --config DIR 是用户直觉写法）
+    #[test]
+    fn test_config_global_accepts_both_positions() {
+        // 顶层位置（传统写法）
+        let top = Cli::try_parse_from(["ops-console", "--config", "a", "serve", "--addr", "127.0.0.1:1"]).unwrap();
+        assert_eq!(top.config, "a");
+        assert!(matches!(top.command, Command::Serve { .. }));
+        // 子命令后位置（serve --config DIR）
+        let sub = Cli::try_parse_from(["ops-console", "serve", "--config", "b", "--addr", "127.0.0.1:1"]).unwrap();
+        assert_eq!(sub.config, "b");
+        // 其他子命令后位置
+        let projects = Cli::try_parse_from(["ops-console", "projects", "--config", "c"]).unwrap();
+        assert_eq!(projects.config, "c");
+    }
+}
