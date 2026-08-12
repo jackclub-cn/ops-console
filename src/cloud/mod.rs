@@ -6,11 +6,6 @@
 pub mod aliyun;
 pub mod driver;
 
-/// 当前已接入的云服务商 kind 列表（唯一权威来源）。
-/// 前端配置页“添加服务商”下拉、资源页 provider Tab 均从此处获取；
-/// 接入新服务商（tencent/aws…）时在此追加，前端无需改动。
-pub const SUPPORTED_PROVIDERS: &[&str] = &["aliyun"];
-
 use serde::{Deserialize, Serialize};
 
 /// 统一的服务器/实例抽象（跨服务商）

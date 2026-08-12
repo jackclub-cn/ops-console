@@ -4,10 +4,11 @@
 
 use crate::cloud::aliyun::{scan_regions, AliyunProvider};
 use crate::cloud::driver::{Command, DiskGroup, DiskGroups, ProviderDriver};
+use crate::cloud::Server;
 use crate::config::{Config, Project, ProviderConfig};
 use crate::ops;
 use crate::ops::ecs::AutoSnapshotStatus;
-use crate::ops::expiry::{DomainAlert, ExpiryAlert};
+use crate::ops::expiry::{self, DomainAlert, ExpiryAlert};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 
@@ -178,6 +179,160 @@ impl ProviderDriver for AliyunDriver {
         }
         let servers: Vec<_> = scan.items.into_iter().flatten().collect();
         Ok(ops::expiry::check_servers(servers, thresholds, Utc::now()))
+    }
+
+    async fn resources(
+        &self,
+        cfg: &Config,
+        project: &Project,
+    ) -> Result<serde_json::Value> {
+        let pcfg = cfg.provider(project, self.kind())?;
+        let (ak, sk) = self.credentials(pcfg)?;
+        let region = pcfg.region.clone();
+        let mut out = serde_json::Map::new();
+        out.insert(
+            "swas".to_string(),
+            serde_json::to_value(collect_swas(&ak, &sk, &region).await)?,
+        );
+        out.insert(
+            "ecs".to_string(),
+            serde_json::to_value(collect_ecs(&ak, &sk, &region).await)?,
+        );
+        out.insert(
+            "domains".to_string(),
+            serde_json::to_value(collect_domains(&ak, &sk).await)?,
+        );
+        Ok(serde_json::Value::Object(out))
+    }
+}
+
+/// 资源条目（SWAS / ECS / 域名统一结构；auto_renew 仅域名使用）
+#[derive(serde::Serialize)]
+pub struct ResourceItem {
+    pub id: String,
+    pub name: String,
+    pub region: String,
+    pub status: String,
+    pub expired_at: Option<String>,
+    pub days_left: Option<i64>,
+    pub auto_renew: bool,
+}
+
+#[derive(serde::Serialize)]
+pub struct ResourceGroup {
+    pub ok: bool,
+    pub error: Option<String>,
+    pub items: Vec<ResourceItem>,
+}
+
+fn resource_item(server: Server) -> ResourceItem {
+    let days_left = server
+        .expired_at
+        .map(|t| expiry::days_left(t, Utc::now()));
+    ResourceItem {
+        id: server.id,
+        name: server.name,
+        region: server.region,
+        status: server.status,
+        expired_at: server.expired_at.map(|t| t.to_rfc3339()),
+        days_left,
+        auto_renew: false,
+    }
+}
+
+fn resource_error(msg: String) -> ResourceGroup {
+    ResourceGroup {
+        ok: false,
+        error: Some(msg),
+        items: Vec::new(),
+    }
+}
+
+/// SWAS 实例资源（global 模式跨地域汇总已内聚于 AliyunProvider::list_servers）。
+async fn collect_swas(ak: &str, sk: &str, region: &str) -> ResourceGroup {
+    use crate::cloud::CloudProvider;
+
+    match AliyunProvider::new(ak, sk, region).await {
+        Ok(p) => match p.list_servers().await {
+            Ok(servers) => ResourceGroup {
+                ok: true,
+                error: None,
+                items: servers.into_iter().map(resource_item).collect(),
+            },
+            Err(e) => resource_error(format!("{e:#}")),
+        },
+        Err(e) => resource_error(format!("{e:#}")),
+    }
+}
+
+/// ECS 实例资源：跨地域遍历（权限类错误跳过；非权限错误记录地域）。
+async fn collect_ecs(ak: &str, sk: &str, region: &str) -> ResourceGroup {
+    use crate::cloud::aliyun::is_permission_error;
+
+    match AliyunProvider::new(ak, sk, region).await {
+        Ok(p) => {
+            let mut items = Vec::new();
+            let mut errs: Vec<String> = Vec::new();
+            let mut no_perm = 0;
+            for g in p.groups() {
+                match g.ecs.list_servers().await {
+                    Ok(s) => items.extend(s.into_iter().map(resource_item)),
+                    Err(e) if is_permission_error(&e) => no_perm += 1,
+                    Err(e) => errs.push(format!("{}: {e:#}", g.region)),
+                }
+            }
+            let error = if !errs.is_empty() {
+                Some(format!("部分地域查询失败: {}", errs.join("; ")))
+            } else if items.is_empty() && no_perm > 0 {
+                Some(format!("{} 个地域无 ECS 权限（可能未购买/未授权）", no_perm))
+            } else {
+                None
+            };
+            ResourceGroup {
+                ok: true,
+                error,
+                items,
+            }
+        }
+        Err(e) => resource_error(format!("{e:#}")),
+    }
+}
+
+/// 域名资源（账号级全局服务）；权限类错误视为"未注册域名"跳过（不标失败）。
+async fn collect_domains(ak: &str, sk: &str) -> ResourceGroup {
+    use crate::cloud::aliyun::is_permission_error;
+
+    match crate::cloud::aliyun::domain::DomainClient::new(ak, sk)
+        .list_domains()
+        .await
+    {
+        Ok(ds) => ResourceGroup {
+            ok: true,
+            error: None,
+            items: ds
+                .into_iter()
+                .map(|d| {
+                    let days_left = d
+                        .expired_at
+                        .map(|t| expiry::days_left(t, Utc::now()));
+                    ResourceItem {
+                        id: d.domain_name.clone(),
+                        name: d.domain_name,
+                        region: "全局".to_string(),
+                        status: String::new(),
+                        expired_at: d.expired_at.map(|t| t.to_rfc3339()),
+                        days_left,
+                        auto_renew: d.auto_renew,
+                    }
+                })
+                .collect(),
+        },
+        Err(e) if is_permission_error(&e) => ResourceGroup {
+            ok: true,
+            error: Some("无 domain 权限（可能未注册域名）".to_string()),
+            items: Vec::new(),
+        },
+        Err(e) => resource_error(format!("{e:#}")),
     }
 }
 

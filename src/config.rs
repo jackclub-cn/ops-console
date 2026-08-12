@@ -170,30 +170,6 @@ impl Config {
     }
 }
 
-impl ProviderConfig {
-    pub fn aliyun_credentials(&self) -> Result<(String, String)> {
-        let id = self
-            .access_key_id
-            .clone()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                anyhow!(
-                    "缺少阿里云 AccessKeyId：请填写 project.yml 或设置环境变量 ALIYUN_ACCESS_KEY_ID"
-                )
-            })?;
-        let secret = self
-            .access_key_secret
-            .clone()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                anyhow!(
-                    "缺少阿里云 AccessKeySecret：请填写 project.yml 或设置环境变量 ALIYUN_ACCESS_KEY_SECRET"
-                )
-            })?;
-        Ok((id, secret))
-    }
-}
-
 /// 原子写文件：先写临时文件再 rename；Unix 下设置 0600。
 pub fn write_atomic(path: &Path, content: &str) -> Result<()> {
     // 随机后缀：避免并发保存（同进程多 handler）写同一 tmp 文件相互覆盖
