@@ -7,11 +7,14 @@
 
 pub mod cms;
 pub mod domain;
+pub mod driver;
 pub mod ecs;
 pub mod resourcecenter;
 pub mod rpc;
 pub mod sign;
 pub mod swas;
+
+pub use driver::AliyunDriver;
 
 use crate::cloud::{CloudProvider, Server, Snapshot, SnapshotStatus};
 use crate::config::REGION_GLOBAL;

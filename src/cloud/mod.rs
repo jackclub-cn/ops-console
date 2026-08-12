@@ -4,6 +4,7 @@
 //! 例如：腾讯云 -> `cloud::tencent`，AWS -> `cloud::aws`，RackNerd -> `cloud::racknerd`。
 
 pub mod aliyun;
+pub mod driver;
 
 /// 当前已接入的云服务商 kind 列表（唯一权威来源）。
 /// 前端配置页“添加服务商”下拉、资源页 provider Tab 均从此处获取；
