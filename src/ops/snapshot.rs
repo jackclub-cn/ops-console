@@ -1,6 +1,8 @@
 //! 快照轮转：删旧建新，控制每台服务器保留的快照数量。
 
 use crate::cloud::{CloudProvider, SnapshotStatus};
+use crate::config::NotifyConfig;
+use crate::notify;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use std::time::Duration;
@@ -145,4 +147,59 @@ pub async fn rotate<P: CloudProvider + ?Sized>(
     summary.remaining = after.len();
 
     Ok(summary)
+}
+
+/// 对单服务商的全部实例执行轮转（只依赖 CloudProvider trait，与具体服务商无关）。
+pub async fn rotate_provider<P: CloudProvider + ?Sized>(
+    provider: &P,
+    notify_cfg: &NotifyConfig,
+    keep: usize,
+    wait_minutes: u64,
+) -> anyhow::Result<()> {
+    let servers = provider.list_servers().await?;
+    if servers.is_empty() {
+        println!("  无实例，跳过");
+        return Ok(());
+    }
+
+    let notifier = notify::from_config(notify_cfg)?;
+    let mut errors = Vec::new();
+    for server in &servers {
+        println!("  -- 实例: {} ({})", server.name, server.id);
+        match rotate(
+            provider,
+            &server.id,
+            keep,
+            Duration::from_secs(wait_minutes * 60),
+        )
+        .await
+        {
+            Ok(summary) => {
+                print!("{}", summary.render());
+                // 通知渠道发送结果（失败不阻断主流程，避免告警本身导致退出码非零）
+                if let Some(n) = &notifier {
+                    let title = format!("快照轮转: {} 成功", summary.server_name);
+                    if let Err(e) = n.send(&title, &summary.render()).await {
+                        tracing::warn!("通知发送失败: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                println!("    实例 {} 轮转失败: {e:#}", server.name);
+                errors.push(server.name.clone());
+                // 失败也发钉钉通知（及时告警，不依赖 cron 日志回看）
+                if let Some(n) = &notifier {
+                    let title = format!("快照轮转失败: {}", server.name);
+                    let text = format!("实例 {} ({}) 快照轮转失败:\n{e:#}", server.name, server.id);
+                    if let Err(se) = n.send(&title, &text).await {
+                        tracing::warn!("失败通知发送失败: {se}");
+                    }
+                }
+            }
+        }
+    }
+    if !errors.is_empty() {
+        anyhow::bail!("以下实例轮转失败: {}", errors.join(", "));
+    }
+    Ok(())
 }
