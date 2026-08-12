@@ -271,65 +271,37 @@ fn map_status(s: &str) -> SnapshotStatus {
 #[async_trait::async_trait]
 impl CloudProvider for AliyunProvider {
     async fn list_servers(&self) -> Result<Vec<Server>> {
-        let mut out = Vec::new();
-        // 跨地域容忍：
+        // 跨地域容忍（scan_regions 内聚）：
         // - 权限类错误（未开通/未授权）→ 跳过该地域，不报错（如纯 ECS 账号无 SWAS 权限）
         // - 其他错误（网络/DNS/限流）→ 汇总记录，全部失败才报错
-        let mut failed: Vec<String> = Vec::new();
-        let mut no_perm: Vec<String> = Vec::new();
-        let mut first_err: Option<anyhow::Error> = None;
-        for g in &self.groups {
-            match g.swas.list_instances().await {
-                Ok(instances) => {
-                    out.extend(instances.into_iter().map(|i| {
-                        let id = i.instance_id.clone();
-                        Server {
-                            id,
-                            name: if i.instance_name.is_empty() {
-                                i.instance_id
-                            } else {
-                                i.instance_name
-                            },
-                            region: g.region.clone(),
-                            status: i.status,
-                            expired_at: parse_expired_time(&i.expired_time),
-                        }
-                    }));
-                }
-                Err(e) => {
-                    if is_permission_error(&e) {
-                        no_perm.push(g.region.clone());
-                    } else {
-                        failed.push(g.region.clone());
-                        if first_err.is_none() {
-                            first_err = Some(e);
-                        }
+        let scan = scan_regions(&self.groups, "SWAS 查询", "SWAS", |g| async move {
+            let region = g.region.clone();
+            let instances = g.swas.list_instances().await?;
+            Ok(instances
+                .into_iter()
+                .map(|i| {
+                    let id = i.instance_id.clone();
+                    Server {
+                        id,
+                        name: if i.instance_name.is_empty() {
+                            i.instance_id
+                        } else {
+                            i.instance_name
+                        },
+                        region: region.clone(),
+                        status: i.status,
+                        expired_at: parse_expired_time(&i.expired_time),
                     }
-                }
-            }
+                })
+                .collect::<Vec<_>>())
+        })
+        .await;
+        if let Some(e) = scan.all_failed_err("SWAS 查询") {
+            return Err(e);
         }
-        if !no_perm.is_empty() {
-            tracing::warn!(
-                "{} 个地域无 SWAS 权限（可能未购买/未授权），已跳过: {}",
-                no_perm.len(),
-                no_perm.join(", ")
-            );
-        }
-        if !failed.is_empty() {
-            // 该产品整体未授权/未购买（no_perm 非空）且无任何数据时，DNS/网络等失败
-            // 属于"未开通地域"噪音，不应升级为致命错误
-            if out.is_empty() && no_perm.is_empty() {
-                return Err(anyhow!(
-                    "全部 {} 个地域 SWAS 查询失败（首个错误: {:#}）",
-                    failed.len(),
-                    first_err.as_ref().map(|e| format!("{e:#}")).unwrap_or_default()
-                ));
-            }
-            tracing::warn!(
-                "{} 个地域 SWAS 查询失败，已跳过: {}",
-                failed.len(),
-                failed.join(", ")
-            );
+        let mut out = Vec::new();
+        for servers in scan.items {
+            out.extend(servers);
         }
         Ok(out)
     }
