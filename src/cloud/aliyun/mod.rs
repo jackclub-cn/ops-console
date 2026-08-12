@@ -16,6 +16,7 @@ pub mod swas;
 use crate::cloud::{CloudProvider, Server, Snapshot, SnapshotStatus};
 use crate::config::REGION_GLOBAL;
 use anyhow::{anyhow, Result};
+use std::future::Future;
 use std::time::Duration;
 
 use self::rpc::parse_expired_time;
@@ -173,6 +174,85 @@ fn push_unique(regions: &mut Vec<String>, list: Vec<String>) {
 pub fn is_permission_error(e: &anyhow::Error) -> bool {
     let s = e.to_string();
     s.contains("NoPermission") || s.contains("Forbidden")
+}
+
+/// 跨地域巡检结果。
+pub struct RegionScan<T> {
+    /// 每个成功地域的结果（类型由闭包决定，可为元组）
+    pub items: Vec<T>,
+    /// 权限类错误（无权限/未开通）跳过的地域
+    pub no_perm: Vec<String>,
+    /// 非权限失败：`(地域, 错误信息)`
+    pub failed: Vec<(String, String)>,
+}
+
+impl<T> RegionScan<T> {
+    /// 全部地域失败且无任何产出与权限跳过 → 返回总失败错误；否则 None。
+    ///
+    /// 判定「无任何地域成功返回」而非「合并结果为空」：地域成功返回过（哪怕数据为空）
+    /// 即证明 API 通，不应升级为总失败。
+    pub fn all_failed_err(&self, label: &str) -> Option<anyhow::Error> {
+        if !self.failed.is_empty() && self.items.is_empty() && self.no_perm.is_empty() {
+            let n = self.failed.len();
+            let first = &self.failed[0].1;
+            Some(anyhow!("全部 {n} 个地域 {label} 失败（首个错误: {first}）"))
+        } else {
+            None
+        }
+    }
+}
+
+/// 跨地域巡检：对每个地域执行 `f`，按错误类型分类汇总，并打印跳过提示。
+///
+/// - 权限类错误（[`is_permission_error`]）→ 记入 `no_perm`，打印「无 {product} 权限」跳过提示
+/// - 非权限错误 → 记入 `failed`，打印「{label}失败」跳过提示
+/// 是否升级为总失败由调用方用 [`RegionScan::all_failed_err`] 决定（单资源族返回 Err，
+/// 磁盘等双资源族按族分别记录）。
+///
+/// `f` 接收**按值**的 [`RegionGroup`]（内部克隆，代价可忽略），返回借用无依赖的 future
+/// （async block 拥有该组），避免对引用的高阶生命周期约束。
+pub async fn scan_regions<T, F, Fut>(
+    groups: &[RegionGroup],
+    label: &str,
+    product: &str,
+    f: F,
+) -> RegionScan<T>
+where
+    F: Fn(RegionGroup) -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    let mut scan = RegionScan {
+        items: Vec::new(),
+        no_perm: Vec::new(),
+        failed: Vec::new(),
+    };
+    for g in groups {
+        match f(g.clone()).await {
+            Ok(v) => scan.items.push(v),
+            Err(e) if is_permission_error(&e) => scan.no_perm.push(g.region.clone()),
+            Err(e) => scan.failed.push((g.region.clone(), format!("{e:#}"))),
+        }
+    }
+    if !scan.no_perm.is_empty() {
+        println!(
+            "  跳过 {} 个地域（无 {product} 权限，可能未购买/未授权）: {}",
+            scan.no_perm.len(),
+            scan.no_perm.join(", ")
+        );
+    }
+    if !scan.failed.is_empty() {
+        println!(
+            "  跳过 {} 个地域（{label}失败）: {}",
+            scan.failed.len(),
+            scan
+                .failed
+                .iter()
+                .map(|(r, _)| r.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    scan
 }
 
 fn map_status(s: &str) -> SnapshotStatus {
@@ -362,5 +442,93 @@ mod tests {
         assert!(!is_permission_error(&anyhow::anyhow!("client error (Connect): dns error")));
         assert!(!is_permission_error(&anyhow::anyhow!("阿里云 swas 业务错误 Throttling: Request was denied")));
         assert!(!is_permission_error(&anyhow::anyhow!("响应解析失败 (ListInstances)")));
+    }
+
+    #[tokio::test]
+    async fn test_scan_regions_all_ok() {
+        let groups = vec![
+            RegionGroup::new("ak", "sk", "cn-a"),
+            RegionGroup::new("ak", "sk", "cn-b"),
+        ];
+        let scan = scan_regions(&groups, "检查", "SWAS", |_| async { Ok(1u8) }).await;
+        assert_eq!(scan.items, vec![1, 1]);
+        assert!(scan.no_perm.is_empty());
+        assert!(scan.failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_scan_regions_permission_skipped() {
+        let groups = vec![
+            RegionGroup::new("ak", "sk", "cn-a"),
+            RegionGroup::new("ak", "sk", "cn-b"),
+            RegionGroup::new("ak", "sk", "cn-c"),
+        ];
+        let scan = scan_regions(&groups, "检查", "SWAS", |g: RegionGroup| async move {
+            if g.region == "cn-b" {
+                Err(anyhow::anyhow!(
+                    "阿里云 swas API HTTP 403 (ListInstances): NoPermission: nope"
+                ))
+            } else {
+                Ok(1u8)
+            }
+        })
+        .await;
+        assert_eq!(scan.no_perm, vec!["cn-b".to_string()]);
+        assert_eq!(scan.items, vec![1, 1]);
+        assert!(scan.failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_scan_regions_real_error_recorded() {
+        let groups = vec![
+            RegionGroup::new("ak", "sk", "cn-a"),
+            RegionGroup::new("ak", "sk", "cn-b"),
+        ];
+        let scan = scan_regions(&groups, "磁盘检查", "SWAS", |g: RegionGroup| async move {
+            if g.region == "cn-b" {
+                Err(anyhow::anyhow!("dns error"))
+            } else {
+                Ok(1u8)
+            }
+        })
+        .await;
+        assert_eq!(scan.failed.len(), 1);
+        assert_eq!(scan.failed[0].0, "cn-b");
+        assert!(scan.failed[0].1.contains("dns"));
+        assert_eq!(scan.items, vec![1]);
+    }
+
+    #[test]
+    fn test_all_failed_err() {
+        // 全失败 → Some，消息含 label 与首个错误
+        let s = RegionScan::<i32> {
+            items: vec![],
+            no_perm: vec![],
+            failed: vec![("cn-a".into(), "boom".into())],
+        };
+        let e = s.all_failed_err("检查").unwrap();
+        assert!(e.to_string().contains("全部 1 个地域 检查 失败"));
+        assert!(e.to_string().contains("boom"));
+        // 有成功返回（哪怕空数据）→ None（成功返回过即证明 API 通）
+        let s = RegionScan {
+            items: vec![1],
+            no_perm: vec![],
+            failed: vec![("cn-a".into(), "boom".into())],
+        };
+        assert!(s.all_failed_err("检查").is_none());
+        // 有权限跳过 → None（权限跳过不算总失败）
+        let s = RegionScan::<i32> {
+            items: vec![],
+            no_perm: vec!["cn-a".into()],
+            failed: vec![("cn-b".into(), "boom".into())],
+        };
+        assert!(s.all_failed_err("检查").is_none());
+        // 无失败 → None
+        let s = RegionScan::<i32> {
+            items: vec![],
+            no_perm: vec![],
+            failed: vec![],
+        };
+        assert!(s.all_failed_err("检查").is_none());
     }
 }
