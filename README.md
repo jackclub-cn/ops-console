@@ -8,7 +8,7 @@
 
 - 多项目 × 多服务商配置（`config/project.yml`），一条命令遍历全部项目/服务商
 - 阿里云轻量服务器快照轮转：删旧建新，保留指定份数，自动等待就绪
-- 服务器到期提醒：命中 30/15/3 天阈值（可配置）或已过期时通知（SWAS + ECS）
+- 到期提醒：服务器（SWAS + ECS）与域名命中 30/15/3 天阈值（可配置）或已过期时通知，一次 `expiry` 全查
 - ECS 自动快照策略检查：巡检实例磁盘是否绑定了自动快照策略，随 `snapshot` 一起执行，未开启的汇总通知
 - 磁盘占用检查：SWAS（DescribeMonitorData）+ ECS（云监控 diskusage_utilization）使用率超阈值（默认 90%，--threshold 可配）或数据缺失时通知
 - 通知渠道抽象：钉钉机器人（加签 + 标题签名），可替换扩展
@@ -34,7 +34,7 @@ cp config/notify.yml.example config/notify.yml   # 可选，不需要通知可�
 ./target/release/ops-console --project demo snapshot --keep 2
 ./target/release/ops-console --provider aliyun snapshot --keep 2
 
-# 服务器到期提醒（默认 30/15/3 天阈值，可 --days 自定义）
+# 到期提醒（服务器 SWAS+ECS + 域名，默认 30/15/3 天阈值，可 --days 自定义）
 ./target/release/ops-console expiry
 ./target/release/ops-console expiry --days 60,30,7
 
@@ -42,9 +42,9 @@ cp config/notify.yml.example config/notify.yml   # 可选，不需要通知可�
 ./target/release/ops-console disk
 ./target/release/ops-console disk --threshold 85
 
-# ECS 检查随 snapshot / expiry 一起执行，无需单独命令：
+# 检查随 snapshot / expiry 一起执行，无需单独命令：
 #   snapshot  → 轮转 + ECS 自动快照策略检查
-#   expiry    → SWAS + ECS 到期提醒
+#   expiry    → 服务器（SWAS + ECS）+ 域名到期提醒
 ```
 
 ## Web 管理界面
@@ -131,11 +131,9 @@ ops-console [--config <目录>] [--project <名>] [--provider <kind>] snapshot [
                              随后检查 ECS 自动快照策略（未开启的实例汇总通知）
                              单项目/服务商/实例失败不阻断其余，最后汇总报错并退出非零
   expiry [--days 30,15,3]
-                             到期提醒：检查 SWAS + ECS 全部实例到期时间，命中阈值
-                             （或已过期）时输出并汇总发一条通知；无命中则不通知
-  expiry-domain [--days 30,15,3]
-                             域名到期提醒：账号级全局资源（与地域无关），检查全部域名
-                             到期时间；开启自动续费的域名会标注；无命中则不通知
+                             到期提醒：检查服务器（SWAS + ECS 全部实例）与域名到期时间，
+                             命中阈值（或已过期）时输出并汇总发一条通知（自动续费的域名会标注）；
+                             无命中则不通知
   disk [--threshold 90]
                              磁盘占用检查：SWAS + ECS 全部 Running 实例，
                              使用率达到阈值或数据缺失时输出并汇总发一条通知
@@ -209,7 +207,7 @@ ECS 只读检查最小权限策略：
 }
 ```
 
-域名到期提醒（`expiry-domain`）最小权限策略（域名是全局服务，`RamCode` 为 `domain`）：
+域名到期检查（随 `expiry` 执行）最小权限策略（域名是全局服务，`RamCode` 为 `domain`）：
 
 ```json
 {
@@ -241,11 +239,12 @@ global 模式目录加速（可选但强烈建议，将地域遍历从 32 个缩
 
 ## 到期提醒策略
 
-1. 读取实例到期时间（阿里云 `ListInstances` 返回的 `ExpiredTime`，无需额外 API）
-2. 剩余天数向上取整；**精确命中**阈值（默认 30/15/3 天）或已过期（<= 0 天）时提醒
-3. 每天 cron 跑一次时，精确命中只有一天，天然不重复提醒；已过期则每次运行都提醒（紧急）
-4. 全部命中项汇总为**一条**通知发送（避免刷屏）；无命中不通知
-5. 按量付费等无到期时间的实例自动跳过
+1. 读取服务器到期时间（阿里云 SWAS `ListInstances` / ECS `DescribeInstances` 返回的 `ExpiredTime`，无需额外 API）
+2. 域名到期时间来自 `domain:QueryDomainList`（`ExpirationDate`），随 `expiry` 一并检查（账号级全局资源，不受地域影响）；自动续费的域名会标注
+3. 剩余天数向上取整；**精确命中**阈值（默认 30/15/3 天）或已过期（<= 0 天）时提醒
+4. 每天 cron 跑一次时，精确命中只有一天，天然不重复提醒；已过期则每次运行都提醒（紧急）
+5. 服务器与域名全部命中项汇总为**一条**通知发送（避免刷屏）；无命中不通知
+6. 按量付费等无到期时间的实例自动跳过
 
 ## cron 示例
 
@@ -256,7 +255,7 @@ global 模式目录加速（可选但强烈建议，将地域遍历从 32 个缩
   --config /opt/ops-console/config \
   snapshot --keep 2 >> /var/log/ops-console.log 2>&1
 
-# 每日 09:00 检查服务器到期（30/15/3 天阈值），命中才通知
+# 每日 09:00 检查到期（服务器 + 域名，30/15/3 天阈值），命中才通知
 0 9 * * * DINGTALK_WEBHOOK_URL=... DINGTALK_SECRET=... \
   /opt/ops-console/target/release/ops-console \
   --config /opt/ops-console/config \

@@ -3,7 +3,7 @@
 //! 用法示例：
 //!   ops-console projects
 //!   ops-console snapshot --keep 2        # 快照轮转 + ECS 自动快照策略检查
-//!   ops-console expiry --days 30,15,3    # SWAS + ECS 到期提醒
+//!   ops-console expiry --days 30,15,3    # 服务器（SWAS + ECS）+ 域名到期提醒
 //!   ops-console disk --threshold 90      # SWAS + ECS 磁盘占用检查（超阈值/数据缺失通知）
 //!   ops-console --project demo --provider aliyun snapshot --keep 2
 //!
@@ -65,15 +65,8 @@ enum Command {
         wait_minutes: u64,
     },
 
-    /// 服务器到期提醒：命中阈值（或已过期）时输出并通知
+    /// 到期提醒：检查服务器（SWAS + ECS）与域名到期，命中阈值（或已过期）时输出并通知
     Expiry {
-        /// 提醒阈值（天），逗号分隔
-        #[arg(long, default_value = "30,15,3")]
-        days: String,
-    },
-
-    /// 域名到期提醒：命中阈值（或已过期）时输出并通知（域名是账号级全局资源）
-    ExpiryDomain {
         /// 提醒阈值（天），逗号分隔
         #[arg(long, default_value = "30,15,3")]
         days: String,
@@ -187,9 +180,10 @@ async fn main() -> anyhow::Result<()> {
 
             let targets = select_projects(&cfg, cli.project.as_deref())?;
 
-            // 汇总全部项目/服务商的命中提醒，最后发一条通知（避免刷屏）
+            // 汇总全部项目/服务商的命中提醒（服务器 SWAS+ECS + 域名），最后发一条通知（避免刷屏）
             let notifier = crate::notify::from_config(&cfg.notify)?;
             let mut alerts: Vec<(String, String, ops::expiry::ExpiryAlert)> = Vec::new();
+            let mut domain_alerts: Vec<(String, String, ops::expiry::DomainAlert)> = Vec::new();
             let mut errors = Vec::new();
             for project in &targets {
                 println!("\n===== 项目: {} =====", project.name);
@@ -228,76 +222,47 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
-                }
-            }
-
-            if !alerts.is_empty() {
-                let text = ops::expiry::render(&alerts);
-                println!("{text}");
-                if let Some(n) = &notifier {
-                    let title = format!("服务器到期提醒: {} 台需关注", alerts.len());
-                    if let Err(e) = n.send(&title, &text).await {
-                        tracing::warn!("通知发送失败: {e}");
-                    }
-                }
-            } else {
-                let list = thresholds
-                    .iter()
-                    .map(|t| t.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                println!("全部实例均在安全期内（{list} 天内无到期）");
-            }
-
-            if !errors.is_empty() {
-                anyhow::bail!("以下服务商检查失败: {}", errors.join(", "));
-            }
-            Vec::new()
-        }
-        Command::ExpiryDomain { days } => {
-            let thresholds = parse_thresholds(&days)?;
-            let targets = select_projects(&cfg, cli.project.as_deref())?;
-
-            // 域名是账号级全局资源，每个项目查一次（不受地域影响）
-            let notifier = crate::notify::from_config(&cfg.notify)?;
-            let mut alerts: Vec<(String, String, ops::expiry::DomainAlert)> = Vec::new();
-            let mut errors = Vec::new();
-            for project in &targets {
-                println!("\n===== 项目: {} =====", project.name);
-                let drivers = match drivers_for_project(project, cli.provider.as_deref()) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        println!("项目 {} 域名检查失败: {e:#}", project.name);
-                        errors.push(project.name.clone());
-                        continue;
-                    }
-                };
-                for driver in drivers {
-                    if !driver.commands().contains(&DriverCommand::ExpiryDomain) {
-                        continue;
-                    }
-                    match driver.domain_expiry(&cfg, project, &thresholds).await {
-                        Ok(list) => alerts.extend(list.into_iter().map(|a| {
-                            (project.name.clone(), driver.kind().to_string(), a)
-                        })),
-                        Err(e) => {
-                            if cloud::aliyun::is_permission_error(&e) {
-                                // 账号未开通/未授权域名服务（如无域名资源）→ 跳过，不视为失败
-                                println!("  跳过域名检查（无 domain 权限，可能未注册域名）");
-                            } else {
-                                println!("域名到期检查失败: {e:#}");
-                                errors.push(driver.kind().to_string());
+                    // 域名到期检查（账号级全局资源，不受地域影响）
+                    if driver.commands().contains(&DriverCommand::ExpiryDomain) {
+                        match driver.domain_expiry(&cfg, project, &thresholds).await {
+                            Ok(list) => domain_alerts.extend(list.into_iter().map(|a| {
+                                (project.name.clone(), driver.kind().to_string(), a)
+                            })),
+                            Err(e) => {
+                                if cloud::aliyun::is_permission_error(&e) {
+                                    // 账号未开通/未授权域名服务（如无域名资源）→ 跳过，不视为失败
+                                    println!("  跳过域名检查（无 domain 权限，可能未注册域名）");
+                                } else {
+                                    println!("域名到期检查失败: {e:#}");
+                                    errors.push(driver.kind().to_string());
+                                }
                             }
                         }
                     }
                 }
             }
 
-            if !alerts.is_empty() {
-                let text = ops::expiry::render_domains(&alerts);
+            if !alerts.is_empty() || !domain_alerts.is_empty() {
+                let mut text = String::new();
+                if !alerts.is_empty() {
+                    text.push_str(&ops::expiry::render(&alerts));
+                }
+                if !domain_alerts.is_empty() {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&ops::expiry::render_domains(&domain_alerts));
+                }
                 println!("{text}");
                 if let Some(n) = &notifier {
-                    let title = format!("域名到期提醒: {} 个需关注", alerts.len());
+                    let mut parts = Vec::new();
+                    if !alerts.is_empty() {
+                        parts.push(format!("{} 台服务器", alerts.len()));
+                    }
+                    if !domain_alerts.is_empty() {
+                        parts.push(format!("{} 个域名", domain_alerts.len()));
+                    }
+                    let title = format!("到期提醒: {}", parts.join(", "));
                     if let Err(e) = n.send(&title, &text).await {
                         tracing::warn!("通知发送失败: {e}");
                     }
@@ -308,11 +273,11 @@ async fn main() -> anyhow::Result<()> {
                     .map(|t| t.to_string())
                     .collect::<Vec<_>>()
                     .join(", ");
-                println!("全部域名均在安全期内（{list} 天内无到期）");
+                println!("全部资源均在安全期内（{list} 天内无到期）");
             }
 
             if !errors.is_empty() {
-                anyhow::bail!("以下项目域名检查失败: {}", errors.join(", "));
+                anyhow::bail!("以下服务商检查失败: {}", errors.join(", "));
             }
             Vec::new()
         }

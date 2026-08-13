@@ -14,9 +14,9 @@ use anyhow::{anyhow, Result};
 pub enum Command {
     /// 快照轮转
     Snapshot,
-    /// 服务器到期提醒
+    /// 服务器到期提醒（含 ECS，见 [`Command::EcsExpiry`]）
     Expiry,
-    /// 域名到期提醒
+    /// 域名到期检查（随 expiry 命令执行，账号级全局资源）
     ExpiryDomain,
     /// 磁盘占用检查
     Disk,
